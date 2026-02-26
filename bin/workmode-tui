@@ -162,8 +162,17 @@ cmd_preview_session() {
         local pid
         pid="$(json_field_num "$session_line" "pid")"
         if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-            echo "⚠ Process $pid is no longer running (stale session)."
-            echo "  Use 'workmode sessions stop $short_id' to clean up."
+            # Auto-clean stale session
+            local trigger started working_dir
+            trigger="$(json_field "$session_line" "trigger")"
+            started="$(json_field "$session_line" "started")"
+            working_dir="$(json_field "$session_line" "working_dir")"
+            local duration=$(( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo "$(date +%s)") ))
+            printf '{"id":"%s","short":"%s","trigger":"%s","working_dir":"%s","started":"%s","status":"error","duration":%d}\n' \
+                "$full_id" "$short_id" "$trigger" "$working_dir" "$started" "$duration" \
+                >> "$HISTORY_FILE"
+            rm -f "${STATE_DIR}/locks/${trigger}.lock"
+            echo "⚠ Process $pid was no longer running — marked as error."
             echo ""
         else
             local elapsed=""

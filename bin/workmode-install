@@ -205,6 +205,45 @@ uninstall_watcher_service() {
     echo "Watcher service removed."
 }
 
+# --- Config watcher → auto-reinstall on config change ---
+
+CONFIG_WATCHER="workmode-config-watcher"
+
+install_config_watcher() {
+    echo "Installing config watcher..."
+
+    cat > "$SYSTEMD_DIR/${CONFIG_WATCHER}.service" <<SERVICE
+[Unit]
+Description=Workmode config auto-reinstall
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_DIR}/workmode-install install
+SERVICE
+
+    cat > "$SYSTEMD_DIR/${CONFIG_WATCHER}.path" <<PATH
+[Unit]
+Description=Watch workmode config for changes
+
+[Path]
+PathModified=${WORKMODE_CONFIG}
+
+[Install]
+WantedBy=default.target
+PATH
+
+    systemctl --user daemon-reload
+    echo "Config watcher installed."
+}
+
+uninstall_config_watcher() {
+    systemctl --user stop "${CONFIG_WATCHER}.path" 2>/dev/null || true
+    systemctl --user disable "${CONFIG_WATCHER}.path" 2>/dev/null || true
+    rm -f "$SYSTEMD_DIR/${CONFIG_WATCHER}.path" "$SYSTEMD_DIR/${CONFIG_WATCHER}.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "Config watcher removed."
+}
+
 # --- Helpers: interval/cron → OnCalendar ---
 
 # Convert interval like "2h", "15m" to systemd timer directives
@@ -263,12 +302,14 @@ case "${1:-install}" in
     install)
         install_timers
         install_watcher_service
+        install_config_watcher
         echo ""
         echo "Run 'workmode on' to activate triggers."
         ;;
     uninstall)
         uninstall_timers
         uninstall_watcher_service
+        uninstall_config_watcher
         ;;
     enable)
         enable_timers

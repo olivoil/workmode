@@ -8,6 +8,7 @@ source "$SCRIPT_DIR/lib/config.sh"
 BIN_DIR="$SCRIPT_DIR/bin"
 STATE_DIR="$(config_state_dir)"
 WATCHER_SERVICE="workmode-watcher"
+CONFIG_WATCHER="workmode-config-watcher"
 UNIT_PREFIX="workmode-trigger-"
 
 VERSION="0.1.0"
@@ -56,6 +57,13 @@ cmd_on() {
         echo "Watcher service started."
     fi
 
+    # Enable and start config watcher
+    if systemctl --user cat "${CONFIG_WATCHER}.path" &>/dev/null; then
+        systemctl --user enable "${CONFIG_WATCHER}.path" 2>/dev/null || true
+        systemctl --user start "${CONFIG_WATCHER}.path" 2>/dev/null || true
+        echo "Config watcher started."
+    fi
+
     echo ""
     echo "Workmode is ON."
     cmd_status
@@ -68,6 +76,12 @@ cmd_off() {
     if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
         systemctl --user stop "$WATCHER_SERVICE"
         echo "Watcher service stopped."
+    fi
+
+    # Stop config watcher
+    if systemctl --user is-active "${CONFIG_WATCHER}.path" &>/dev/null; then
+        systemctl --user stop "${CONFIG_WATCHER}.path"
+        echo "Config watcher stopped."
     fi
 
     # Disable timers (but don't remove units)
