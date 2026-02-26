@@ -115,9 +115,11 @@ STARTED="$(date -Iseconds)"
 log_entry() {
     local status="$1"
     shift
-    printf '{"id":"%s","trigger":"%s","label":"%s","started":"%s","status":"%s"%s}\n' \
-        "$SESSION_ID" "$TRIGGER_NAME" "$DISPLAY_LABEL" "$STARTED" "$status" "$*" \
-        >> "$HISTORY_FILE"
+    # Write to temp file then append atomically to avoid partial reads
+    local entry
+    entry="$(printf '{"id":"%s","trigger":"%s","label":"%s","started":"%s","status":"%s"%s}' \
+        "$SESSION_ID" "$TRIGGER_NAME" "$DISPLAY_LABEL" "$STARTED" "$status" "$*")"
+    echo "$entry" >> "$HISTORY_FILE"
 }
 
 log_entry "running" ",\"pid\":$$"
@@ -132,7 +134,7 @@ case "$PERMISSIONS" in
     # default: no extra flags
 esac
 
-CLAUDE_CMD+=(--output-format stream-json)
+CLAUDE_CMD+=(--output-format stream-json --verbose)
 
 # Build the prompt — use explicit prompt if set, otherwise the skill name
 PROMPT="${PROMPT_TEXT:-$SKILL}"
@@ -148,8 +150,9 @@ EXIT_CODE=0
 
 cd "$WORKING_DIR"
 
+# Unset CLAUDECODE to allow running from within a Claude session
 # Run claude, capture output, extract session ID
-"${CLAUDE_CMD[@]}" "$PROMPT" > "$SESSION_LOG" 2>&1 || EXIT_CODE=$?
+env -u CLAUDECODE "${CLAUDE_CMD[@]}" "$PROMPT" > "$SESSION_LOG" 2>&1 || EXIT_CODE=$?
 
 # Try to extract the Claude session ID from stream-json output
 # The session ID appears in the init message

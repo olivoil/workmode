@@ -144,8 +144,11 @@ cmd_list() {
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
+        # Skip malformed lines (e.g. partial writes)
+        [[ "$line" == *'"id"'* ]] || continue
         local id
         id="$(json_field "$line" "id")"
+        [[ -z "$id" ]] && continue
 
         # Skip if already seen this id
         local already_seen=false
