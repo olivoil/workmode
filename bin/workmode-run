@@ -207,7 +207,20 @@ while true; do
         FINAL_EXIT_CODE=$EXIT_CODE
         break
     else
-        log_entry "error" "${EXTRA},\"exit_code\":${EXIT_CODE}"
+        # Capture first line of log as error hint if log is small (likely a startup error)
+        local error_hint=""
+        if [[ -f "$SESSION_LOG" ]]; then
+            local log_size
+            log_size="$(wc -c < "$SESSION_LOG")"
+            if (( log_size > 0 && log_size < 500 )); then
+                error_hint="$(head -1 "$SESSION_LOG" | tr '"' "'" | head -c 200)"
+            fi
+        fi
+        if [[ -n "$error_hint" ]]; then
+            log_entry "error" "${EXTRA},\"exit_code\":${EXIT_CODE},\"error\":\"${error_hint}\""
+        else
+            log_entry "error" "${EXTRA},\"exit_code\":${EXIT_CODE}"
+        fi
         FINAL_EXIT_CODE=$EXIT_CODE
     fi
 

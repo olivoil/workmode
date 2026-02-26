@@ -132,8 +132,22 @@ cmd_list() {
         full_id="$(json_field "$line" "id")"
 
         summary=""
-        if [[ -f "$LOG_DIR/${full_id}.log" ]]; then
+        if [[ -f "$LOG_DIR/${full_id}.log" && -s "$LOG_DIR/${full_id}.log" ]]; then
             summary="$(extract_summary "$LOG_DIR/${full_id}.log" 50)"
+        fi
+        if [[ -z "$summary" ]]; then
+            local error_hint
+            error_hint="$(json_field "$line" "error")"
+            if [[ -n "$error_hint" ]]; then
+                summary="$error_hint"
+                (( ${#summary} > 50 )) && summary="${summary:0:49}…"
+            else
+                local exit_code
+                exit_code="$(json_field_num "$line" "exit_code")"
+                if [[ -n "$exit_code" && "$exit_code" != "0" ]]; then
+                    summary="exit code $exit_code"
+                fi
+            fi
         fi
 
         printf "%s %-14s %-14s %-10s %-14s %b%s%b\n" \
@@ -185,18 +199,49 @@ cmd_logs() {
         exit 1
     fi
 
+    # Always show session metadata from history
+    local session_line
+    session_line="$(resolve_session "$TARGET_ID" "$HISTORY_FILE" 2>/dev/null || true)"
+
+    if [[ -n "$session_line" ]]; then
+        local full_id status trigger started duration exit_code attempt session_id working_dir
+        full_id="$(json_field "$session_line" "id")"
+        status="$(json_field "$session_line" "status")"
+        trigger="$(json_field "$session_line" "trigger")"
+        started="$(json_field "$session_line" "started")"
+        duration="$(json_field_num "$session_line" "duration")"
+        exit_code="$(json_field_num "$session_line" "exit_code")"
+        attempt="$(json_field_num "$session_line" "attempt")"
+        session_id="$(json_field "$session_line" "session_id")"
+        working_dir="$(json_field "$session_line" "working_dir")"
+
+        echo -e "${BOLD}Session: ${TARGET_ID}${RESET}"
+        echo "Status:   $status"
+        echo "Trigger:  $trigger"
+        echo "Started:  $(format_time "$started")"
+        [[ -n "$duration" && "$duration" != "0" ]] && echo "Duration: $(format_duration "$duration")"
+        [[ -n "$working_dir" ]] && echo "Dir:      $working_dir"
+        [[ -n "$session_id" ]] && echo "Claude:   $session_id"
+        [[ -n "$exit_code" ]] && echo -e "Exit:     ${RED}${exit_code}${RESET}"
+        [[ -n "$attempt" && "$attempt" != "1" ]] && echo "Attempt:  $attempt"
+        echo ""
+    else
+        echo -e "${BOLD}Session: ${TARGET_ID}${RESET}"
+        echo ""
+    fi
+
     local log_file
-    log_file="$(find_session_log "$TARGET_ID" "$LOG_DIR" "$HISTORY_FILE")" || {
-        echo "No log found for session '$TARGET_ID'." >&2
-        echo "Logs are stored in: $LOG_DIR/" >&2
-        exit 1
-    }
+    log_file="$(find_session_log "$TARGET_ID" "$LOG_DIR" "$HISTORY_FILE" 2>/dev/null || true)"
 
-    echo -e "${BOLD}Session: ${TARGET_ID}${RESET}"
-    echo -e "Log file: ${log_file}"
-    echo ""
-
-    format_session_log "$log_file"
+    if [[ -n "$log_file" && -s "$log_file" ]]; then
+        echo -e "${DIM}─── Log output ───${RESET}"
+        echo ""
+        format_session_log "$log_file"
+    elif [[ -n "$log_file" && -f "$log_file" ]]; then
+        echo -e "${DIM}(log file is empty — session may have crashed before producing output)${RESET}"
+    else
+        echo -e "${DIM}(no log file found)${RESET}"
+    fi
 }
 
 cmd_stop() {

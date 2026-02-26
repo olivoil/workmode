@@ -34,8 +34,22 @@ cmd_sessions_list() {
         duration="$(json_field_num "$line" "duration")"
 
         summary=""
-        if [[ -f "$LOG_DIR/${full_id}.log" ]]; then
+        if [[ -f "$LOG_DIR/${full_id}.log" && -s "$LOG_DIR/${full_id}.log" ]]; then
             summary="$(extract_summary "$LOG_DIR/${full_id}.log" 50)"
+        fi
+        if [[ -z "$summary" ]]; then
+            local error_hint
+            error_hint="$(json_field "$line" "error")"
+            if [[ -n "$error_hint" ]]; then
+                summary="$error_hint"
+                (( ${#summary} > 50 )) && summary="${summary:0:49}…"
+            else
+                local exit_code
+                exit_code="$(json_field_num "$line" "exit_code")"
+                if [[ -n "$exit_code" && "$exit_code" != "0" ]]; then
+                    summary="exit code $exit_code"
+                fi
+            fi
         fi
 
         printf "%-16s  %-5s  %-14s  %-14s  %-6s  %s\n" \
@@ -107,7 +121,7 @@ cmd_preview_session() {
         return
     }
 
-    local full_id status trigger label started duration session_id working_dir
+    local full_id status trigger label started duration session_id working_dir exit_code attempt
     full_id="$(json_field "$session_line" "id")"
     status="$(json_field "$session_line" "status")"
     trigger="$(json_field "$session_line" "trigger")"
@@ -116,6 +130,8 @@ cmd_preview_session() {
     duration="$(json_field_num "$session_line" "duration")"
     session_id="$(json_field "$session_line" "session_id")"
     working_dir="$(json_field "$session_line" "working_dir")"
+    exit_code="$(json_field_num "$session_line" "exit_code")"
+    attempt="$(json_field_num "$session_line" "attempt")"
 
     echo "Session:  $short_id"
     echo "Full ID:  $full_id"
@@ -126,6 +142,8 @@ cmd_preview_session() {
     [[ -n "$duration" && "$duration" != "0" ]] && echo "Duration: $(format_duration "$duration")"
     [[ -n "$working_dir" ]] && echo "Dir:      $working_dir"
     [[ -n "$session_id" ]] && echo "Claude:   $session_id"
+    [[ -n "$exit_code" ]] && echo "Exit:     $exit_code"
+    [[ -n "$attempt" && "$attempt" != "1" ]] && echo "Attempt:  $attempt"
     echo "─────────────────────────────────────────"
     echo ""
 
@@ -143,8 +161,12 @@ cmd_preview_session() {
         fi
         echo "Session in progress${elapsed:+ ($elapsed elapsed)}..."
         echo "Output will appear here once available."
+    elif [[ -f "$log_file" ]]; then
+        echo "(log file is empty — session crashed before producing output)"
+        [[ -n "$exit_code" ]] && echo "Exit code: $exit_code"
     else
         echo "(no log file)"
+        [[ -n "$exit_code" ]] && echo "Exit code: $exit_code"
     fi
 }
 
