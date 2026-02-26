@@ -153,7 +153,7 @@ WATCHER_CONFIG
 
     cat >> "$watcher_script" <<WATCHER_BODY
 
-inotifywait -m -r --format '%w%f' -e close_write${inotify_dirs} |
+inotifywait -m -r --format '%w%f' -e close_write -e moved_to${inotify_dirs} |
 while IFS= read -r filepath; do
     filename="\$(basename "\$filepath")"
 WATCHER_BODY
