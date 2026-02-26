@@ -78,13 +78,16 @@ format_time() {
 }
 
 status_icon() {
+    local icon text color
     case "$1" in
-        completed) echo -e "${GREEN}✅ done${RESET}" ;;
-        running)   echo -e "${BLUE}🔄 run${RESET}" ;;
-        stuck)     echo -e "${YELLOW}⏸ stuck${RESET}" ;;
-        error)     echo -e "${RED}❌ err${RESET}" ;;
-        *)         echo "$1" ;;
+        completed) icon="✅"; text="done";  color="$GREEN" ;;
+        running)   icon="🔄"; text="run";   color="$BLUE" ;;
+        stuck)     icon="⏸";  text="stuck"; color="$YELLOW" ;;
+        error)     icon="❌"; text="err";   color="$RED" ;;
+        *)         icon="?";  text="$1";    color="$RESET" ;;
     esac
+    # Pad the visible text to 8 chars, then wrap in color codes
+    printf "%s %b%-7s%b" "$icon" "$color" "$text" "$RESET"
 }
 
 # --- Parse args ---
@@ -181,10 +184,9 @@ cmd_list() {
         return
     fi
 
-    # Table header
-    printf "${BOLD}%-10s %-14s %-24s %-18s %-8s %-20s${RESET}\n" \
+    # Table header — widths: status=10, trigger=14, label=22, started=14, duration=10, id=rest
+    printf "${BOLD}%-10s %-14s %-22s %-14s %-10s %s${RESET}\n" \
         "STATUS" "TRIGGER" "LABEL" "STARTED" "DURATION" "ID"
-    echo "────────── ────────────── ──────────────────────── ────────────────── ──────── ────────────────────"
 
     for line in "${lines[@]}"; do
         local status trigger label started duration id
@@ -195,7 +197,8 @@ cmd_list() {
         duration="$(json_field_num "$line" "duration")"
         id="$(json_field "$line" "id")"
 
-        printf "%-18s %-14s %-24s %-18s %-8s %s\n" \
+        # status_icon self-pads to ~10 visible chars, so print it raw then the rest
+        printf "%s %-14s %-22s %-14s %-10s %s\n" \
             "$(status_icon "$status")" \
             "$trigger" \
             "$label" \
