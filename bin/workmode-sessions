@@ -291,11 +291,38 @@ cmd_tail() {
     }
 
     echo -e "${BOLD}Tailing session: ${TARGET_ID}${RESET}"
-    echo -e "Log file: ${log_file}"
     echo -e "(Ctrl+C to stop)"
     echo ""
 
-    tail -f "$log_file"
+    # Show existing content formatted, then follow new lines
+    if [[ -s "$log_file" ]]; then
+        format_session_log "$log_file"
+        echo ""
+    fi
+
+    # Follow new lines and format them as they arrive
+    tail -n 0 -f "$log_file" | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if command -v jq &>/dev/null; then
+            echo "$line" | jq -r --arg blue "${BLUE}" --arg green "${GREEN}" --arg reset "${RESET}" '
+                if .type == "assistant" then
+                    (.message.content // [])[] |
+                    if .type == "text" then .text
+                    elif .type == "tool_use" then "\($blue)[tool: \(.name)]\($reset)"
+                    else empty
+                    end
+                elif .type == "result" then
+                    .result // empty | "\($green)\(.)\($reset)"
+                else empty
+                end
+            ' 2>/dev/null || true
+        else
+            # Fallback: show type hints for non-json-aware terminals
+            local type
+            type="$(echo "$line" | grep -oP '"type"\s*:\s*"[^"]*"' | head -1 | grep -oP '"[^"]*"$' | tr -d '"' 2>/dev/null || true)"
+            [[ "$type" == "assistant" || "$type" == "result" ]] && echo "$line"
+        fi
+    done
 }
 
 # --- Dispatch ---

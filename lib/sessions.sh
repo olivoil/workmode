@@ -140,39 +140,46 @@ find_session_log() {
 format_session_log() {
     local log_file="$1"
 
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-
-        local type
-        type="$(echo "$line" | grep -oP '"type"\s*:\s*"[^"]*"' | grep -oP '"[^"]*"$' | tr -d '"' 2>/dev/null || true)"
-
-        case "$type" in
-            assistant)
-                local text
-                text="$(echo "$line" | grep -oP '"content"\s*:\s*"[^"]*"' | head -1 | sed 's/"content"\s*:\s*"//;s/"$//' | sed 's/\\n/\n/g' 2>/dev/null || true)"
-                if [[ -n "$text" ]]; then
-                    echo -e "$text"
-                fi
-                ;;
-            tool_use)
-                local tool_name
-                tool_name="$(echo "$line" | grep -oP '"name"\s*:\s*"[^"]*"' | head -1 | grep -oP '"[^"]*"$' | tr -d '"' 2>/dev/null || true)"
-                if [[ -n "$tool_name" ]]; then
-                    echo -e "${BLUE}[tool: ${tool_name}]${RESET}"
-                fi
-                ;;
-            result)
-                local result_text
-                result_text="$(echo "$line" | grep -oP '"result"\s*:\s*"[^"]*"' | head -1 | sed 's/"result"\s*:\s*"//;s/"$//' | sed 's/\\n/\n/g' 2>/dev/null || true)"
-                if [[ -n "$result_text" ]]; then
-                    echo -e "${GREEN}${result_text}${RESET}"
-                fi
-                ;;
-            "")
-                echo "$line"
-                ;;
-        esac
-    done < "$log_file"
+    if command -v jq &>/dev/null; then
+        jq -r --arg blue "${BLUE}" --arg green "${GREEN}" --arg reset "${RESET}" '
+            if .type == "assistant" then
+                (.message.content // [])[] |
+                if .type == "text" then .text
+                elif .type == "tool_use" then "\($blue)[tool: \(.name)]\($reset)"
+                else empty
+                end
+            elif .type == "result" then
+                .result // empty | "\($green)\(.)\($reset)"
+            else empty
+            end
+        ' "$log_file" 2>/dev/null
+    else
+        # Fallback: use grep to extract text fields from assistant messages
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local type
+            type="$(echo "$line" | grep -oP '"type"\s*:\s*"[^"]*"' | head -1 | grep -oP '"[^"]*"$' | tr -d '"' 2>/dev/null || true)"
+            case "$type" in
+                assistant)
+                    # content is an array; extract "text" fields from text-type entries
+                    local texts
+                    texts="$(echo "$line" | grep -oP '"type"\s*:\s*"text"[^}]*"text"\s*:\s*"[^"]*"' | grep -oP '"text"\s*:\s*"[^"]*"$' | sed 's/"text"\s*:\s*"//;s/"$//' | sed 's/\\n/\n/g' 2>/dev/null || true)"
+                    [[ -n "$texts" ]] && echo -e "$texts"
+                    # extract tool_use names
+                    local tools
+                    tools="$(echo "$line" | grep -oP '"type"\s*:\s*"tool_use"[^}]*"name"\s*:\s*"[^"]*"' | grep -oP '"name"\s*:\s*"[^"]*"' | grep -oP '"[^"]*"$' | tr -d '"' 2>/dev/null || true)"
+                    while IFS= read -r tool_name; do
+                        [[ -n "$tool_name" ]] && echo -e "${BLUE}[tool: ${tool_name}]${RESET}"
+                    done <<< "$tools"
+                    ;;
+                result)
+                    local result_text
+                    result_text="$(echo "$line" | grep -oP '"result"\s*:\s*"[^"]*"' | head -1 | sed 's/"result"\s*:\s*"//;s/"$//' | sed 's/\\n/\n/g' 2>/dev/null || true)"
+                    [[ -n "$result_text" ]] && echo -e "${GREEN}${result_text}${RESET}"
+                    ;;
+            esac
+        done < "$log_file"
+    fi
 }
 
 # Extract a short summary from a session log file
@@ -184,22 +191,36 @@ extract_summary() {
 
     local summary=""
 
-    # Strategy 1: "result" field from the result line (clean final output)
-    summary="$(grep -m1 '"type":"result"' "$log_file" 2>/dev/null \
-        | grep -oP '"result"\s*:\s*"[^"]*"' \
-        | head -1 \
-        | sed 's/"result"\s*:\s*"//;s/"$//' \
-        | sed 's/\\n/ /g' \
-        || true)"
+    if command -v jq &>/dev/null; then
+        # Strategy 1: last assistant text (final answer)
+        summary="$(tac "$log_file" 2>/dev/null | jq -r '
+            select(.type == "assistant") |
+            [.message.content[]? | select(.type == "text") | .text] |
+            if length > 0 then .[0] | gsub("\n"; " ") else empty end
+        ' 2>/dev/null | head -1 || true)"
 
-    # Strategy 2: first assistant text content
-    if [[ -z "$summary" ]]; then
-        summary="$(grep -m1 '"type":"assistant"' "$log_file" 2>/dev/null \
-            | grep -oP '"text":"[^"]*"' \
+        # Strategy 2: result field
+        if [[ -z "$summary" ]]; then
+            summary="$(jq -r 'select(.type == "result") | .result // empty | gsub("\n"; " ")' "$log_file" 2>/dev/null | tail -1 || true)"
+        fi
+    else
+        # Strategy 1: "result" field from the result line (clean final output)
+        summary="$(grep -m1 '"type":"result"' "$log_file" 2>/dev/null \
+            | grep -oP '"result"\s*:\s*"[^"]*"' \
             | head -1 \
-            | sed 's/"text":"//;s/"$//' \
+            | sed 's/"result"\s*:\s*"//;s/"$//' \
             | sed 's/\\n/ /g' \
             || true)"
+
+        # Strategy 2: first assistant text content
+        if [[ -z "$summary" ]]; then
+            summary="$(grep -m1 '"type":"assistant"' "$log_file" 2>/dev/null \
+                | grep -oP '"text":"[^"]*"' \
+                | head -1 \
+                | sed 's/"text":"//;s/"$//' \
+                | sed 's/\\n/ /g' \
+                || true)"
+        fi
     fi
 
     # Truncate

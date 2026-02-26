@@ -308,7 +308,7 @@ cmd_tui() {
 
         if [[ "$mode" == "sessions" ]]; then
             result="$( "$self" --sessions-list | fzf \
-                --header=$'SESSIONS  ctrl-t: triggers | enter: log/tail | ctrl-r: resume | ctrl-x: run | ctrl-s: stop | ctrl-k: kill | ctrl-l: refresh\n' \
+                --header=$'SESSIONS  enter: log/tail | ctrl-d/u: scroll preview | ctrl-r: resume | ctrl-x: run | ctrl-s: stop | ctrl-k: kill | ctrl-t: triggers | ctrl-l: refresh\n' \
                 --preview="$self --preview-session {1}" \
                 --preview-window="right:55%:wrap" \
                 --expect="ctrl-r,ctrl-t,ctrl-x,ctrl-s,ctrl-k" \
