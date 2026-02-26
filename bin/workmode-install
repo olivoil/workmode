@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# workmode-install — Reads config → generates crontab entries + systemd watcher service
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+source "$SCRIPT_DIR/lib/config.sh"
+
+BIN_DIR="$SCRIPT_DIR/bin"
+STATE_DIR="$(config_state_dir)"
+LOG_DIR="$STATE_DIR/logs"
+CRON_MARKER="# workmode:"
+SERVICE_NAME="workmode-watcher"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$SYSTEMD_DIR"
+
+# --- Crontab management ---
+
+install_crontab() {
+    echo "Installing crontab entries..."
+
+    # Get existing crontab, strip old workmode entries
+    local existing
+    existing="$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER" || true)"
+
+    local new_entries=""
+
+    for name in $(config_triggers_by_type "timer"); do
+        local schedule label cron_expr interval
+
+        # Explicit cron expression takes priority over interval
+        cron_expr="$(config_trigger_field "$name" "cron" || true)"
+        if [[ -n "$cron_expr" ]]; then
+            schedule="$cron_expr"
+        else
+            interval="$(config_trigger_field "$name" "interval")"
+            schedule="$(interval_to_cron "$interval")"
+        fi
+
+        # Label for display
+        label="$(config_trigger_field "$name" "skill" || config_trigger_field "$name" "prompt" | head -c 40 || echo "$name")"
+
+        new_entries+="${CRON_MARKER}${name}"$'\n'
+        new_entries+="${schedule} ${BIN_DIR}/workmode-run --trigger ${name} >> ${LOG_DIR}/${name}.log 2>&1"$'\n'
+
+        echo "  + $name: $schedule → $label"
+    done
+
+    if [[ -n "$new_entries" ]]; then
+        echo "${existing}"$'\n'"${new_entries}" | crontab -
+    else
+        echo "$existing" | crontab -
+    fi
+
+    echo "Crontab updated."
+}
+
+uninstall_crontab() {
+    echo "Removing crontab entries..."
+    local existing
+    existing="$(crontab -l 2>/dev/null || true)"
+
+    # Remove workmode lines and the marker comment lines
+    echo "$existing" | grep -v "$CRON_MARKER" | crontab -
+    echo "Crontab cleaned."
+}
+
+# --- Systemd watcher service ---
+
+install_watcher_service() {
+    local has_file_triggers=false
+
+    # Collect all watch directories and patterns
+    local watch_dirs=()
+    local trigger_names=()
+
+    for name in $(config_triggers_by_type "file"); do
+        has_file_triggers=true
+        local watch_dir
+        watch_dir="$(config_trigger_field "$name" "watch")"
+        watch_dirs+=("$watch_dir")
+        trigger_names+=("$name")
+    done
+
+    if ! $has_file_triggers; then
+        echo "No file triggers configured, skipping watcher service."
+        # Remove service if it exists
+        if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
+            systemctl --user stop "$SERVICE_NAME"
+            systemctl --user disable "$SERVICE_NAME"
+        fi
+        rm -f "$SYSTEMD_DIR/${SERVICE_NAME}.service"
+        return
+    fi
+
+    echo "Installing watcher service..."
+
+    # Build the watcher script
+    local watcher_script="$STATE_DIR/watcher.sh"
+    cat > "$watcher_script" <<'WATCHER_HEADER'
+#!/usr/bin/env bash
+set -euo pipefail
+WATCHER_HEADER
+
+    cat >> "$watcher_script" <<WATCHER_CONFIG
+SCRIPT_DIR="$SCRIPT_DIR"
+source "\$SCRIPT_DIR/lib/config.sh"
+BIN_DIR="$BIN_DIR"
+WATCHER_CONFIG
+
+    # Build inotifywait command with all watch directories
+    local inotify_dirs=""
+    for dir in "${watch_dirs[@]}"; do
+        inotify_dirs+=" $(printf '%q' "$dir")"
+    done
+
+    cat >> "$watcher_script" <<WATCHER_BODY
+
+inotifywait -m -r --format '%w%f' -e close_write${inotify_dirs} |
+while IFS= read -r filepath; do
+    filename="\$(basename "\$filepath")"
+WATCHER_BODY
+
+    # Add pattern matching for each file trigger
+    for name in $(config_triggers_by_type "file"); do
+        local pattern watch_dir
+        pattern="$(config_trigger_field "$name" "pattern")"
+        watch_dir="$(config_trigger_field "$name" "watch")"
+
+        cat >> "$watcher_script" <<MATCH_BLOCK
+    # Trigger: $name
+    if [[ "\$filepath" == ${watch_dir}/* ]] && [[ "\$filename" == $pattern ]]; then
+        "$BIN_DIR/workmode-run" --trigger "$name" --file "\$filepath" &
+        continue
+    fi
+MATCH_BLOCK
+    done
+
+    echo "done" >> "$watcher_script"
+    chmod +x "$watcher_script"
+
+    # Generate systemd service
+    cat > "$SYSTEMD_DIR/${SERVICE_NAME}.service" <<SERVICE
+[Unit]
+Description=Workmode file watcher
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=$watcher_script
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+SERVICE
+
+    systemctl --user daemon-reload
+    echo "Watcher service installed."
+}
+
+uninstall_watcher_service() {
+    if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
+        systemctl --user stop "$SERVICE_NAME"
+    fi
+    if systemctl --user is-enabled "$SERVICE_NAME" &>/dev/null; then
+        systemctl --user disable "$SERVICE_NAME"
+    fi
+    rm -f "$SYSTEMD_DIR/${SERVICE_NAME}.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "Watcher service removed."
+}
+
+# --- Main ---
+
+case "${1:-install}" in
+    install)
+        install_crontab
+        install_watcher_service
+        echo ""
+        echo "Run 'workmode on' to activate triggers."
+        ;;
+    uninstall)
+        uninstall_crontab
+        uninstall_watcher_service
+        ;;
+    *)
+        echo "Usage: workmode-install [install|uninstall]"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# workmode-sessions — List session history, filter, resume
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+source "$SCRIPT_DIR/lib/config.sh"
+
+STATE_DIR="$(config_state_dir)"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+RESET='\033[0m'
+BOLD='\033[1m'
+
+usage() {
+    cat <<EOF
+Usage: workmode-sessions [OPTIONS] [COMMAND]
+
+Commands:
+  list              List recent sessions (default)
+  resume <id>       Resume a session with claude --resume
+
+Options:
+  --running         Show only running sessions
+  --stuck           Show only stuck sessions
+  --completed       Show only completed sessions
+  --all             Show all sessions (default: last 20)
+  -n <count>        Number of sessions to show
+  --json            Output raw JSON
+
+EOF
+    exit 0
+}
+
+# Extract JSON field value (simple, no jq dependency)
+json_field() {
+    local json="$1" field="$2"
+    echo "$json" | grep -oP "\"${field}\"\\s*:\\s*\"[^\"]*\"" | head -1 | grep -oP '"[^"]*"$' | tr -d '"'
+}
+
+json_field_num() {
+    local json="$1" field="$2"
+    echo "$json" | grep -oP "\"${field}\"\\s*:\\s*[0-9]+" | head -1 | grep -oP '[0-9]+$'
+}
+
+format_duration() {
+    local seconds="$1"
+    [[ -z "$seconds" || "$seconds" == "0" ]] && echo "—" && return
+    if (( seconds < 60 )); then
+        echo "${seconds}s"
+    elif (( seconds < 3600 )); then
+        echo "$(( seconds / 60 ))m"
+    else
+        echo "$(( seconds / 3600 ))h$(( (seconds % 3600) / 60 ))m"
+    fi
+}
+
+format_time() {
+    local iso_time="$1"
+    [[ -z "$iso_time" ]] && echo "—" && return
+
+    local today
+    today="$(date +%Y-%m-%d)"
+    local day="${iso_time%%T*}"
+    local time="${iso_time#*T}"
+    time="${time%%[-+]*}"  # strip timezone
+    time="${time%:*}"      # HH:MM
+
+    if [[ "$day" == "$today" ]]; then
+        echo "$time today"
+    else
+        echo "$time ${day#*-}"  # MM-DD
+    fi
+}
+
+status_icon() {
+    case "$1" in
+        completed) echo -e "${GREEN}✅ done${RESET}" ;;
+        running)   echo -e "${BLUE}🔄 run${RESET}" ;;
+        stuck)     echo -e "${YELLOW}⏸ stuck${RESET}" ;;
+        error)     echo -e "${RED}❌ err${RESET}" ;;
+        *)         echo "$1" ;;
+    esac
+}
+
+# --- Parse args ---
+FILTER=""
+COUNT=20
+COMMAND="list"
+OUTPUT="table"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        resume)
+            COMMAND="resume"
+            shift
+            RESUME_ID="${1:-}"
+            shift || true
+            ;;
+        list)      COMMAND="list"; shift ;;
+        --running)   FILTER="running"; shift ;;
+        --stuck)     FILTER="stuck"; shift ;;
+        --completed) FILTER="completed"; shift ;;
+        --all)       COUNT=0; shift ;;
+        -n)          COUNT="$2"; shift 2 ;;
+        --json)      OUTPUT="json"; shift ;;
+        --help|-h)   usage ;;
+        *)
+            # If it looks like an ID, treat as resume
+            if [[ "$1" =~ ^wm- ]]; then
+                COMMAND="resume"
+                RESUME_ID="$1"
+                shift
+            else
+                echo "Unknown option: $1" >&2
+                usage
+            fi
+            ;;
+    esac
+done
+
+# --- Commands ---
+
+cmd_list() {
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        echo "No sessions yet."
+        exit 0
+    fi
+
+    # Get the latest status for each session (last line per ID wins)
+    local sessions
+    sessions="$(tac "$HISTORY_FILE")"
+
+    # Filter to final status per session (deduplicate by id)
+    local seen_ids=()
+    local lines=()
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id
+        id="$(json_field "$line" "id")"
+
+        # Skip if already seen this id
+        local already_seen=false
+        for seen in "${seen_ids[@]+"${seen_ids[@]}"}"; do
+            if [[ "$seen" == "$id" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        $already_seen && continue
+
+        seen_ids+=("$id")
+
+        # Apply filter
+        if [[ -n "$FILTER" ]]; then
+            local status
+            status="$(json_field "$line" "status")"
+            [[ "$status" != "$FILTER" ]] && continue
+        fi
+
+        lines+=("$line")
+
+        # Count limit
+        if (( COUNT > 0 && ${#lines[@]} >= COUNT )); then
+            break
+        fi
+    done <<< "$sessions"
+
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        echo "No sessions found${FILTER:+ with status '$FILTER'}."
+        exit 0
+    fi
+
+    if [[ "$OUTPUT" == "json" ]]; then
+        printf '%s\n' "${lines[@]}"
+        return
+    fi
+
+    # Table header
+    printf "${BOLD}%-10s %-14s %-24s %-18s %-8s %-20s${RESET}\n" \
+        "STATUS" "TRIGGER" "LABEL" "STARTED" "DURATION" "ID"
+    echo "────────── ────────────── ──────────────────────── ────────────────── ──────── ────────────────────"
+
+    for line in "${lines[@]}"; do
+        local status trigger label started duration id
+        status="$(json_field "$line" "status")"
+        trigger="$(json_field "$line" "trigger")"
+        label="$(json_field "$line" "label")"
+        started="$(json_field "$line" "started")"
+        duration="$(json_field_num "$line" "duration")"
+        id="$(json_field "$line" "id")"
+
+        printf "%-18s %-14s %-24s %-18s %-8s %s\n" \
+            "$(status_icon "$status")" \
+            "$trigger" \
+            "$label" \
+            "$(format_time "$started")" \
+            "$(format_duration "$duration")" \
+            "$id"
+    done
+}
+
+cmd_resume() {
+    if [[ -z "${RESUME_ID:-}" ]]; then
+        echo "Usage: workmode sessions resume <session-id>" >&2
+        exit 1
+    fi
+
+    # Find the session in history
+    local session_line
+    session_line="$(grep "\"id\":\"${RESUME_ID}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
+
+    if [[ -z "$session_line" ]]; then
+        echo "Session '$RESUME_ID' not found." >&2
+        exit 1
+    fi
+
+    local claude_session_id
+    claude_session_id="$(json_field "$session_line" "session_id")"
+
+    if [[ -n "$claude_session_id" ]]; then
+        echo "Resuming Claude session: $claude_session_id"
+        exec claude --resume "$claude_session_id"
+    else
+        echo "No Claude session ID found for '$RESUME_ID'." >&2
+        echo "The session may not have started successfully."
+        exit 1
+    fi
+}
+
+# --- Dispatch ---
+case "$COMMAND" in
+    list)   cmd_list ;;
+    resume) cmd_resume ;;
+    *)      usage ;;
+esac

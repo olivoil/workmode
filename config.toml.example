@@ -1,0 +1,50 @@
+# Workmode configuration
+# Copy to ~/.config/workmode/config.toml and customize
+#
+# Each trigger can use either:
+#   prompt = "..."   — any text you'd type to Claude (most flexible)
+#   skill = "/..."   — shorthand for a Claude Code skill/slash command
+
+[general]
+state_dir = "~/.local/share/workmode"
+max_parallel = 2
+
+# Transcribe screen recordings when they appear
+[[trigger]]
+name = "transcribe"
+type = "file"
+watch = "~/Videos"
+pattern = "screenrecording-*.mp4"
+cooldown = 120
+skill = "/transcribe-meeting"
+permissions = "skip"
+working_dir = "~/Code/github.com/olivoil/obsidian"
+
+# Refine daily notes every 2 hours
+[[trigger]]
+name = "refine"
+type = "timer"
+interval = "2h"
+skill = "/refine"
+permissions = "skip"
+working_dir = "~/Code/github.com/olivoil/obsidian"
+
+# Check for PRs needing review every 15 minutes
+[[trigger]]
+name = "pr-reviews"
+type = "timer"
+interval = "15m"
+check = "gh api /user/requested_reviews --jq 'length'"
+prompt = "Check my open PR review requests and for each one, checkout the branch in a worktree in ~/Code/github.com/<org/repo>, run /om:code-review - do not post the review to github, but save the review to 🗂️ Projects/PR Reviews/$(date +%Y-%m-%d).md so it can be easily submitted later."
+permissions = "default"
+working_dir = "~/Code/github.com/olivoil/obsidian"
+
+# Daily standup prep at 8:45am
+# [[trigger]]
+# name = "standup-prep"
+# type = "timer"
+# interval = "24h"
+# cron = "45 8 * * 1-5"
+# prompt = "Look at my git commits from yesterday across all projects and prepare a standup summary. Save to today's daily note."
+# permissions = "skip"
+# working_dir = "~/Code/github.com/olivoil/obsidian"

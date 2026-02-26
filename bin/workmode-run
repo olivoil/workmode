@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# workmode-run — Core runner called by triggers
+# Reads trigger config, checks dedup/cooldown, runs claude -p, logs to JSONL, sends notifications.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/notify.sh"
+
+STATE_DIR="$(config_state_dir)"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+LOCK_DIR="$STATE_DIR/locks"
+LOG_DIR="$STATE_DIR/logs"
+
+mkdir -p "$STATE_DIR" "$LOCK_DIR" "$LOG_DIR"
+
+usage() {
+    echo "Usage: workmode-run --trigger <name> [--file <path>]"
+    exit 1
+}
+
+# Parse args
+TRIGGER_NAME=""
+FILE_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --trigger) TRIGGER_NAME="$2"; shift 2 ;;
+        --file)    FILE_PATH="$2"; shift 2 ;;
+        *)         usage ;;
+    esac
+done
+
+[[ -z "$TRIGGER_NAME" ]] && usage
+
+# Load trigger config
+eval "$(config_trigger "$TRIGGER_NAME")" || {
+    echo "Error: trigger '$TRIGGER_NAME' not found in config" >&2
+    exit 1
+}
+
+SKILL="${TRIGGER_skill:-}"
+PROMPT_TEXT="${TRIGGER_prompt:-}"
+PERMISSIONS="${TRIGGER_permissions:-default}"
+WORKING_DIR="${TRIGGER_working_dir:-$PWD}"
+COOLDOWN="${TRIGGER_cooldown:-0}"
+CHECK_CMD="${TRIGGER_check:-}"
+CRON_EXPR="${TRIGGER_cron:-}"
+TYPE="${TRIGGER_type:-timer}"
+
+# Either skill or prompt must be set
+[[ -z "$SKILL" && -z "$PROMPT_TEXT" ]] && {
+    echo "Error: trigger '$TRIGGER_NAME' has no skill or prompt defined" >&2
+    exit 1
+}
+
+# Display label for notifications/logs — prefer skill name, fall back to trigger name
+DISPLAY_LABEL="${SKILL:-$TRIGGER_NAME}"
+
+# Expand working_dir
+WORKING_DIR="${WORKING_DIR/#\~/$HOME}"
+
+# --- Dedup: check if already running ---
+LOCK_FILE="$LOCK_DIR/${TRIGGER_NAME}.lock"
+if [[ -f "$LOCK_FILE" ]]; then
+    LOCK_PID="$(cat "$LOCK_FILE" 2>/dev/null)"
+    if kill -0 "$LOCK_PID" 2>/dev/null; then
+        echo "Trigger '$TRIGGER_NAME' already running (pid $LOCK_PID), skipping"
+        exit 0
+    fi
+    # Stale lock
+    rm -f "$LOCK_FILE"
+fi
+
+# --- Max parallel check ---
+MAX_PARALLEL="$(config_max_parallel)"
+RUNNING_COUNT="$(find "$LOCK_DIR" -name '*.lock' -exec sh -c 'kill -0 "$(cat "$1")" 2>/dev/null && echo 1' _ {} \; | wc -l)"
+if (( RUNNING_COUNT >= MAX_PARALLEL )); then
+    echo "Max parallel ($MAX_PARALLEL) reached, skipping trigger '$TRIGGER_NAME'"
+    exit 0
+fi
+
+# --- Cooldown check ---
+if (( COOLDOWN > 0 )); then
+    LAST_RUN="$(grep "\"trigger\":\"${TRIGGER_NAME}\"" "$HISTORY_FILE" 2>/dev/null | grep '"status":"completed"' | tail -1 | grep -oP '"started":"[^"]*"' | grep -oP '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' || true)"
+    if [[ -n "$LAST_RUN" ]]; then
+        LAST_EPOCH="$(date -d "$LAST_RUN" +%s 2>/dev/null || echo 0)"
+        NOW_EPOCH="$(date +%s)"
+        ELAPSED=$(( NOW_EPOCH - LAST_EPOCH ))
+        if (( ELAPSED < COOLDOWN )); then
+            echo "Cooldown active for '$TRIGGER_NAME' (${ELAPSED}s < ${COOLDOWN}s), skipping"
+            exit 0
+        fi
+    fi
+fi
+
+# --- Pre-check command (e.g., check if there are PRs to review) ---
+if [[ -n "$CHECK_CMD" ]]; then
+    CHECK_RESULT="$(eval "$CHECK_CMD" 2>/dev/null || echo "0")"
+    if [[ "$CHECK_RESULT" == "0" || -z "$CHECK_RESULT" ]]; then
+        echo "Check command returned 0/empty for '$TRIGGER_NAME', skipping"
+        exit 0
+    fi
+fi
+
+# --- Generate session ID ---
+SESSION_ID="wm-$(date +%s)-$$"
+
+# --- Write lock ---
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
+# --- Log: started ---
+STARTED="$(date -Iseconds)"
+log_entry() {
+    local status="$1"
+    shift
+    printf '{"id":"%s","trigger":"%s","label":"%s","started":"%s","status":"%s"%s}\n' \
+        "$SESSION_ID" "$TRIGGER_NAME" "$DISPLAY_LABEL" "$STARTED" "$status" "$*" \
+        >> "$HISTORY_FILE"
+}
+
+log_entry "running" ",\"pid\":$$"
+notify_started "$DISPLAY_LABEL" "$TRIGGER_NAME"
+
+# --- Build claude command ---
+CLAUDE_CMD=(claude -p)
+
+case "$PERMISSIONS" in
+    skip)     CLAUDE_CMD+=(--dangerously-skip-permissions) ;;
+    readonly) CLAUDE_CMD+=(--permission-mode bypassPermissions) ;;
+    # default: no extra flags
+esac
+
+CLAUDE_CMD+=(--output-format stream-json)
+
+# Build the prompt — use explicit prompt if set, otherwise the skill name
+PROMPT="${PROMPT_TEXT:-$SKILL}"
+if [[ -n "$FILE_PATH" ]]; then
+    PROMPT="$PROMPT $FILE_PATH"
+fi
+
+# --- Run claude ---
+SESSION_LOG="$LOG_DIR/${SESSION_ID}.log"
+
+CLAUDE_SESSION_ID=""
+EXIT_CODE=0
+
+cd "$WORKING_DIR"
+
+# Run claude, capture output, extract session ID
+"${CLAUDE_CMD[@]}" "$PROMPT" > "$SESSION_LOG" 2>&1 || EXIT_CODE=$?
+
+# Try to extract the Claude session ID from stream-json output
+# The session ID appears in the init message
+CLAUDE_SESSION_ID="$(grep -oP '"session_id"\s*:\s*"[^"]*"' "$SESSION_LOG" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true)"
+
+# Calculate duration
+ENDED="$(date -Iseconds)"
+DURATION=$(( $(date +%s) - $(date -d "$STARTED" +%s) ))
+
+# --- Determine status and log ---
+EXTRA=",\"duration\":${DURATION}"
+[[ -n "$CLAUDE_SESSION_ID" ]] && EXTRA="${EXTRA},\"session_id\":\"${CLAUDE_SESSION_ID}\""
+[[ -n "$FILE_PATH" ]] && EXTRA="${EXTRA},\"file\":\"${FILE_PATH}\""
+
+if (( EXIT_CODE == 0 )); then
+    log_entry "completed" "$EXTRA"
+    notify_completed "$DISPLAY_LABEL" "$TRIGGER_NAME" "$DURATION"
+elif (( EXIT_CODE == 2 )); then
+    # Exit code 2 typically means permission/interaction needed
+    log_entry "stuck" "$EXTRA"
+    notify_stuck "$DISPLAY_LABEL" "$TRIGGER_NAME" "${CLAUDE_SESSION_ID:-$SESSION_ID}"
+else
+    log_entry "error" "${EXTRA},\"exit_code\":${EXIT_CODE}"
+    notify_error "$DISPLAY_LABEL" "$TRIGGER_NAME" "$SESSION_ID"
+fi
+
+exit $EXIT_CODE

@@ -1,0 +1,14 @@
+[Unit]
+Description=Workmode file watcher (inotifywait)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=__STATE_DIR__/watcher.sh
+Restart=on-failure
+RestartSec=5
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

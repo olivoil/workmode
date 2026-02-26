@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# workmode — Main CLI entrypoint
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+source "$SCRIPT_DIR/lib/config.sh"
+
+BIN_DIR="$SCRIPT_DIR/bin"
+STATE_DIR="$(config_state_dir)"
+SERVICE_NAME="workmode-watcher"
+
+VERSION="0.1.0"
+
+usage() {
+    cat <<EOF
+workmode $VERSION — Automated Claude Code skill runner
+
+Usage: workmode <command> [options]
+
+Commands:
+  on          Activate all triggers (crontab + watcher)
+  off         Deactivate all triggers
+  status      Show current state and trigger list
+  install     Read config and install crontab + watcher service
+  uninstall   Remove crontab entries and watcher service
+  run         Manually run a trigger: workmode run <trigger-name>
+  sessions    List/resume sessions: workmode sessions [--running|--stuck|--completed]
+  triggers    List configured triggers
+  help        Show this help
+
+EOF
+    exit 0
+}
+
+cmd_on() {
+    echo "Activating workmode..."
+
+    # Install first if not already
+    "$BIN_DIR/workmode-install" install
+
+    # Enable and start watcher if service exists
+    if systemctl --user cat "$SERVICE_NAME" &>/dev/null; then
+        systemctl --user enable "$SERVICE_NAME" 2>/dev/null || true
+        systemctl --user start "$SERVICE_NAME" 2>/dev/null || true
+        echo "Watcher service started."
+    fi
+
+    # Mark as active
+    echo "active" > "$STATE_DIR/state"
+    echo ""
+    echo "Workmode is ON."
+    cmd_status
+}
+
+cmd_off() {
+    echo "Deactivating workmode..."
+
+    # Stop watcher service
+    if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
+        systemctl --user stop "$SERVICE_NAME"
+        echo "Watcher service stopped."
+    fi
+
+    # Remove crontab entries
+    "$BIN_DIR/workmode-install" uninstall
+
+    # Mark as inactive
+    echo "inactive" > "$STATE_DIR/state"
+    echo ""
+    echo "Workmode is OFF."
+}
+
+cmd_status() {
+    local state="inactive"
+    [[ -f "$STATE_DIR/state" ]] && state="$(cat "$STATE_DIR/state")"
+
+    echo ""
+    if [[ "$state" == "active" ]]; then
+        echo "  Status: 🟢 ACTIVE"
+    else
+        echo "  Status: 🔴 INACTIVE"
+    fi
+
+    # Watcher service status
+    if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
+        echo "  Watcher: running"
+    else
+        echo "  Watcher: stopped"
+    fi
+
+    # Crontab entries
+    local cron_count
+    cron_count="$(crontab -l 2>/dev/null | grep -c "# workmode:" || echo 0)"
+    echo "  Crontab entries: $cron_count"
+
+    echo ""
+    cmd_triggers
+}
+
+cmd_triggers() {
+    echo "Configured triggers:"
+    echo ""
+    printf "  %-14s %-8s %-10s %-28s %s\n" "NAME" "TYPE" "PERMS" "PROMPT/SKILL" "SCHEDULE/WATCH"
+    echo "  ────────────── ──────── ────────── ──────────────────────────── ──────────────────────"
+
+    for name in $(config_list_triggers); do
+        local type skill prompt_text label permissions interval watch pattern
+        type="$(config_trigger_field "$name" "type" || echo "?")"
+        skill="$(config_trigger_field "$name" "skill" || true)"
+        prompt_text="$(config_trigger_field "$name" "prompt" || true)"
+        permissions="$(config_trigger_field "$name" "permissions" || echo "default")"
+
+        # Show skill if set, otherwise truncated prompt
+        if [[ -n "$skill" ]]; then
+            label="$skill"
+        elif [[ -n "$prompt_text" ]]; then
+            label="${prompt_text:0:26}"
+            (( ${#prompt_text} > 26 )) && label="${label}…"
+        else
+            label="?"
+        fi
+
+        local schedule_info=""
+        if [[ "$type" == "timer" ]]; then
+            local cron_expr
+            cron_expr="$(config_trigger_field "$name" "cron" || true)"
+            if [[ -n "$cron_expr" ]]; then
+                schedule_info="cron: $cron_expr"
+            else
+                interval="$(config_trigger_field "$name" "interval" || echo "?")"
+                schedule_info="every $interval"
+            fi
+        elif [[ "$type" == "file" ]]; then
+            watch="$(config_trigger_field "$name" "watch" || echo "?")"
+            pattern="$(config_trigger_field "$name" "pattern" || echo "*")"
+            schedule_info="$watch ($pattern)"
+        fi
+
+        printf "  %-14s %-8s %-10s %-28s %s\n" \
+            "$name" "$type" "$permissions" "$label" "$schedule_info"
+    done
+    echo ""
+}
+
+cmd_run() {
+    local trigger_name="${1:-}"
+    if [[ -z "$trigger_name" ]]; then
+        echo "Usage: workmode run <trigger-name>" >&2
+        exit 1
+    fi
+    exec "$BIN_DIR/workmode-run" --trigger "$trigger_name"
+}
+
+cmd_sessions() {
+    exec "$BIN_DIR/workmode-sessions" "$@"
+}
+
+# --- Dispatch ---
+COMMAND="${1:-help}"
+shift || true
+
+case "$COMMAND" in
+    on)         cmd_on ;;
+    off)        cmd_off ;;
+    status)     cmd_status ;;
+    install)    "$BIN_DIR/workmode-install" install ;;
+    uninstall)  "$BIN_DIR/workmode-install" uninstall ;;
+    run)        cmd_run "$@" ;;
+    sessions)   cmd_sessions "$@" ;;
+    triggers)   cmd_triggers ;;
+    help|--help|-h) usage ;;
+    version|--version|-v) echo "workmode $VERSION" ;;
+    *)
+        echo "Unknown command: $COMMAND" >&2
+        echo "Run 'workmode help' for usage." >&2
+        exit 1
+        ;;
+esac
