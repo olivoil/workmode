@@ -38,6 +38,13 @@ cmd_sessions_list() {
             summary="$(extract_summary "$LOG_DIR/${full_id}.log" 50)"
         fi
         if [[ -z "$summary" ]]; then
+            local stderr_file="$LOG_DIR/${full_id}.stderr"
+            if [[ -f "$stderr_file" && -s "$stderr_file" ]]; then
+                summary="$(head -1 "$stderr_file" | head -c 50)"
+                (( ${#summary} > 49 )) && summary="${summary:0:49}…"
+            fi
+        fi
+        if [[ -z "$summary" ]]; then
             local error_hint
             error_hint="$(json_field "$line" "error")"
             if [[ -n "$error_hint" ]]; then
@@ -151,22 +158,40 @@ cmd_preview_session() {
     if [[ -f "$log_file" && -s "$log_file" ]]; then
         format_session_log "$log_file" | head -200
     elif [[ "$status" == "running" ]]; then
-        local elapsed=""
-        if [[ -n "$started" ]]; then
-            local start_epoch
-            start_epoch="$(date -d "$started" +%s 2>/dev/null || echo "")"
-            if [[ -n "$start_epoch" ]]; then
-                elapsed="$(format_duration $(( $(date +%s) - start_epoch )))"
+        # Check if the process is actually still alive
+        local pid
+        pid="$(json_field_num "$session_line" "pid")"
+        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            echo "⚠ Process $pid is no longer running (stale session)."
+            echo "  Use 'workmode sessions stop $short_id' to clean up."
+            echo ""
+        else
+            local elapsed=""
+            if [[ -n "$started" ]]; then
+                local start_epoch
+                start_epoch="$(date -d "$started" +%s 2>/dev/null || echo "")"
+                if [[ -n "$start_epoch" ]]; then
+                    elapsed="$(format_duration $(( $(date +%s) - start_epoch )))"
+                fi
             fi
+            echo "Session in progress${elapsed:+ ($elapsed elapsed)}..."
+            echo "Output will appear here once available."
         fi
-        echo "Session in progress${elapsed:+ ($elapsed elapsed)}..."
-        echo "Output will appear here once available."
     elif [[ -f "$log_file" ]]; then
         echo "(log file is empty — session crashed before producing output)"
         [[ -n "$exit_code" ]] && echo "Exit code: $exit_code"
     else
         echo "(no log file)"
         [[ -n "$exit_code" ]] && echo "Exit code: $exit_code"
+    fi
+
+    # Show stderr if present
+    local stderr_file="${log_file%.log}.stderr"
+    if [[ -f "$stderr_file" && -s "$stderr_file" ]]; then
+        echo ""
+        echo "─── stderr ───"
+        echo ""
+        head -20 "$stderr_file"
     fi
 }
 

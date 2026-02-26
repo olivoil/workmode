@@ -162,7 +162,7 @@ FINAL_EXIT_CODE=0
 cd "$WORKING_DIR"
 
 while true; do
-    (( ATTEMPT++ ))
+    (( ++ATTEMPT ))
 
     SESSION_LOG="$LOG_DIR/${SESSION_ID}.log"
     CLAUDE_SESSION_ID=""
@@ -179,8 +179,13 @@ while true; do
     fi
 
     # Unset CLAUDECODE to allow running from within a Claude session
-    # Use stdbuf to disable output buffering so tail -f works on the log file
-    stdbuf -oL env -u CLAUDECODE "${CLAUDE_CMD[@]}" "$PROMPT" > "$SESSION_LOG" 2>&1 || EXIT_CODE=$?
+    # Capture stderr separately — stream-json goes to the log, stderr to .stderr
+    # (stdbuf may not affect Node.js buffering, so stderr is our safety net)
+    STDERR_LOG="${SESSION_LOG%.log}.stderr"
+    env -u CLAUDECODE "${CLAUDE_CMD[@]}" "$PROMPT" > "$SESSION_LOG" 2>"$STDERR_LOG" || EXIT_CODE=$?
+
+    # Clean up empty stderr file
+    [[ -f "$STDERR_LOG" && ! -s "$STDERR_LOG" ]] && rm -f "$STDERR_LOG"
 
     # Try to extract the Claude session ID from stream-json output
     CLAUDE_SESSION_ID="$(grep -oP '"session_id"\s*:\s*"[^"]*"' "$SESSION_LOG" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true)"
@@ -198,6 +203,7 @@ while true; do
     if (( EXIT_CODE == 0 )); then
         log_entry "completed" "$EXTRA"
         notify_completed "$DISPLAY_LABEL" "$TRIGGER_NAME" "$DURATION"
+        [[ -f "$STDERR_LOG" ]] && rm -f "$STDERR_LOG"
         FINAL_EXIT_CODE=0
         break
     elif (( EXIT_CODE == 2 )); then
@@ -207,10 +213,11 @@ while true; do
         FINAL_EXIT_CODE=$EXIT_CODE
         break
     else
-        # Capture first line of log as error hint if log is small (likely a startup error)
-        local error_hint=""
-        if [[ -f "$SESSION_LOG" ]]; then
-            local log_size
+        # Build error hint from stderr or log content
+        error_hint=""
+        if [[ -f "$STDERR_LOG" && -s "$STDERR_LOG" ]]; then
+            error_hint="$(head -5 "$STDERR_LOG" | tr '"' "'" | head -c 200)"
+        elif [[ -f "$SESSION_LOG" ]]; then
             log_size="$(wc -c < "$SESSION_LOG")"
             if (( log_size > 0 && log_size < 500 )); then
                 error_hint="$(head -1 "$SESSION_LOG" | tr '"' "'" | head -c 200)"
@@ -225,7 +232,6 @@ while true; do
     fi
 
     # --- Retry decision ---
-    local should_retry=false 2>/dev/null || true
     should_retry=false
     case "$RETRY" in
         on_error) (( EXIT_CODE != 0 )) && should_retry=true ;;
