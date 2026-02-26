@@ -42,12 +42,16 @@ EOF
 # Extract JSON field value (simple, no jq dependency)
 json_field() {
     local json="$1" field="$2"
-    echo "$json" | grep -oP "\"${field}\"\\s*:\\s*\"[^\"]*\"" | head -1 | grep -oP '"[^"]*"$' | tr -d '"'
+    local result
+    result="$(echo "$json" | grep -oP "\"${field}\"\\s*:\\s*\"[^\"]*\"" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true)"
+    echo "$result"
 }
 
 json_field_num() {
     local json="$1" field="$2"
-    echo "$json" | grep -oP "\"${field}\"\\s*:\\s*[0-9]+" | head -1 | grep -oP '[0-9]+$'
+    local result
+    result="$(echo "$json" | grep -oP "\"${field}\"\\s*:\\s*[0-9]+" | head -1 | grep -oP '[0-9]+$' || true)"
+    echo "$result"
 }
 
 format_duration() {
@@ -128,10 +132,10 @@ while [[ $# -gt 0 ]]; do
         --json)      OUTPUT="json"; shift ;;
         --help|-h)   usage ;;
         *)
-            # If it looks like an ID, treat as resume
-            if [[ "$1" =~ ^wm- ]]; then
-                COMMAND="resume"
-                RESUME_ID="$1"
+            # If it looks like a session ID (short or full), treat as logs
+            if [[ "$1" =~ ^wm- ]] || [[ "$1" =~ ^[a-z]+-[0-9a-f]{4}$ ]]; then
+                COMMAND="logs"
+                TARGET_ID="$1"
                 shift
             else
                 echo "Unknown option: $1" >&2
@@ -207,13 +211,15 @@ cmd_list() {
         "STATUS" "TRIGGER" "LABEL" "STARTED" "DURATION" "ID"
 
     for line in "${lines[@]}"; do
-        local status trigger label started duration id
+        local status trigger label started duration short_id
         status="$(json_field "$line" "status")"
         trigger="$(json_field "$line" "trigger")"
         label="$(json_field "$line" "label")"
         started="$(json_field "$line" "started")"
         duration="$(json_field_num "$line" "duration")"
-        id="$(json_field "$line" "id")"
+        short_id="$(json_field "$line" "short")"
+        # Fall back to full id for older entries without short id
+        [[ -z "$short_id" ]] && short_id="$(json_field "$line" "id")"
 
         # status_icon self-pads to ~10 visible chars, so print it raw then the rest
         printf "%s %-14s %-22s %-14s %-10s %s\n" \
@@ -222,24 +228,45 @@ cmd_list() {
             "$label" \
             "$(format_time "$started")" \
             "$(format_duration "$duration")" \
-            "$id"
+            "$short_id"
     done
+}
+
+# Resolve a short or full session ID to the history line
+# Usage: resolve_session <id>
+# Prints the matching history line (last entry for that session)
+resolve_session() {
+    local lookup="$1"
+
+    # Try full ID first
+    local match
+    match="$(grep "\"id\":\"${lookup}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
+    if [[ -n "$match" ]]; then
+        echo "$match"
+        return 0
+    fi
+
+    # Try short ID
+    match="$(grep "\"short\":\"${lookup}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
+    if [[ -n "$match" ]]; then
+        echo "$match"
+        return 0
+    fi
+
+    return 1
 }
 
 cmd_resume() {
     if [[ -z "${RESUME_ID:-}" ]]; then
-        echo "Usage: workmode sessions resume <session-id>" >&2
+        echo "Usage: workmode sessions resume <id>" >&2
         exit 1
     fi
 
-    # Find the session in history
     local session_line
-    session_line="$(grep "\"id\":\"${RESUME_ID}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
-
-    if [[ -z "$session_line" ]]; then
+    session_line="$(resolve_session "$RESUME_ID")" || {
         echo "Session '$RESUME_ID' not found." >&2
         exit 1
-    fi
+    }
 
     local claude_session_id
     claude_session_id="$(json_field "$session_line" "session_id")"
@@ -255,25 +282,23 @@ cmd_resume() {
 }
 
 find_session_log() {
-    local id="$1"
-    local log_file="$LOG_DIR/${id}.log"
+    local lookup="$1"
 
-    if [[ -f "$log_file" ]]; then
-        echo "$log_file"
+    # Direct log file by full ID
+    if [[ -f "$LOG_DIR/${lookup}.log" ]]; then
+        echo "$LOG_DIR/${lookup}.log"
         return 0
     fi
 
-    # Try to find by trigger name log (for older entries)
+    # Resolve short/full ID to get the full ID for the log file
     local session_line
-    session_line="$(grep "\"id\":\"${id}\"" "$HISTORY_FILE" 2>/dev/null | head -1 || true)"
-    if [[ -n "$session_line" ]]; then
-        local trigger
-        trigger="$(json_field "$session_line" "trigger")"
-        local trigger_log="$LOG_DIR/${trigger}.log"
-        if [[ -f "$trigger_log" ]]; then
-            echo "$trigger_log"
-            return 0
-        fi
+    session_line="$(resolve_session "$lookup")" || return 1
+
+    local full_id
+    full_id="$(json_field "$session_line" "id")"
+    if [[ -n "$full_id" && -f "$LOG_DIR/${full_id}.log" ]]; then
+        echo "$LOG_DIR/${full_id}.log"
+        return 0
     fi
 
     return 1

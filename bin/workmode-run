@@ -104,7 +104,10 @@ if [[ -n "$CHECK_CMD" ]]; then
 fi
 
 # --- Generate session ID ---
-SESSION_ID="wm-$(date +%s)-$$"
+# Full ID for uniqueness, short ID for human use (trigger-xxxx)
+FULL_ID="wm-$(date +%s)-$$"
+SHORT_ID="${TRIGGER_NAME}-$(printf '%04x' $(( (RANDOM * RANDOM) % 65536 )) )"
+SESSION_ID="$FULL_ID"
 
 # --- Write lock ---
 echo $$ > "$LOCK_FILE"
@@ -115,10 +118,9 @@ STARTED="$(date -Iseconds)"
 log_entry() {
     local status="$1"
     shift
-    # Write to temp file then append atomically to avoid partial reads
     local entry
-    entry="$(printf '{"id":"%s","trigger":"%s","label":"%s","started":"%s","status":"%s"%s}' \
-        "$SESSION_ID" "$TRIGGER_NAME" "$DISPLAY_LABEL" "$STARTED" "$status" "$*")"
+    entry="$(printf '{"id":"%s","short":"%s","trigger":"%s","label":"%s","started":"%s","status":"%s"%s}' \
+        "$SESSION_ID" "$SHORT_ID" "$TRIGGER_NAME" "$DISPLAY_LABEL" "$STARTED" "$status" "$*")"
     echo "$entry" >> "$HISTORY_FILE"
 }
 

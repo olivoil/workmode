@@ -19,15 +19,18 @@ workmode $VERSION — Automated Claude Code skill runner
 Usage: workmode <command> [options]
 
 Commands:
-  on          Activate all triggers (crontab + watcher)
-  off         Deactivate all triggers
-  status      Show current state and trigger list
-  install     Read config and install crontab + watcher service
-  uninstall   Remove crontab entries and watcher service
-  run         Manually run a trigger: workmode run <trigger-name>
-  sessions    List/resume sessions: workmode sessions [--running|--stuck|--completed]
-  triggers    List configured triggers
-  help        Show this help
+  on              Activate all triggers (crontab + watcher)
+  off             Deactivate all triggers
+  status          Show current state and trigger list
+  install         Read config and install crontab + watcher service
+  uninstall       Remove crontab entries and watcher service
+  run <trigger>   Manually run a trigger
+  sessions        List sessions: workmode sessions [--running|--stuck|--completed]
+  logs <id>       Show full output of a session
+  tail <id>       Follow a running session's output
+  resume <id>     Jump into a session with claude --resume
+  triggers        List configured triggers
+  help            Show this help
 
 EOF
     exit 0
@@ -172,6 +175,9 @@ case "$COMMAND" in
     uninstall)  "$BIN_DIR/workmode-install" uninstall ;;
     run)        cmd_run "$@" ;;
     sessions)   cmd_sessions "$@" ;;
+    logs|log)   cmd_sessions logs "$@" ;;
+    tail)       cmd_sessions tail "$@" ;;
+    resume)     cmd_sessions resume "$@" ;;
     triggers)   cmd_triggers ;;
     help|--help|-h) usage ;;
     version|--version|-v) echo "workmode $VERSION" ;;
