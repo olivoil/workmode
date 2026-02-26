@@ -9,13 +9,17 @@ STATE_DIR="$(config_state_dir)"
 HISTORY_FILE="$STATE_DIR/history.jsonl"
 LOG_DIR="$STATE_DIR/logs"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-RESET='\033[0m'
-BOLD='\033[1m'
+# Colors (disabled when piping)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    RESET='\033[0m'
+    BOLD='\033[1m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' RESET='' BOLD=''
+fi
 
 usage() {
     cat <<EOF
