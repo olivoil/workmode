@@ -119,8 +119,8 @@ log_entry() {
     local status="$1"
     shift
     local entry
-    entry="$(printf '{"id":"%s","short":"%s","trigger":"%s","label":"%s","started":"%s","status":"%s"%s}' \
-        "$SESSION_ID" "$SHORT_ID" "$TRIGGER_NAME" "$DISPLAY_LABEL" "$STARTED" "$status" "$*")"
+    entry="$(printf '{"id":"%s","short":"%s","trigger":"%s","label":"%s","working_dir":"%s","started":"%s","status":"%s"%s}' \
+        "$SESSION_ID" "$SHORT_ID" "$TRIGGER_NAME" "$DISPLAY_LABEL" "$WORKING_DIR" "$STARTED" "$status" "$*")"
     echo "$entry" >> "$HISTORY_FILE"
 }
 
@@ -128,6 +128,8 @@ log_entry "running" ",\"pid\":$$"
 notify_started "$DISPLAY_LABEL" "$TRIGGER_NAME"
 
 # --- Build claude command ---
+# Use -p (print mode) for non-interactive execution.
+# Sessions are persisted by default and can be resumed with --resume.
 CLAUDE_CMD=(claude -p)
 
 case "$PERMISSIONS" in

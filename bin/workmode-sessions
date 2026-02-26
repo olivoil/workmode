@@ -271,14 +271,22 @@ cmd_resume() {
     local claude_session_id
     claude_session_id="$(json_field "$session_line" "session_id")"
 
-    if [[ -n "$claude_session_id" ]]; then
-        echo "Resuming Claude session: $claude_session_id"
-        exec claude --resume "$claude_session_id"
-    else
+    if [[ -z "$claude_session_id" ]]; then
         echo "No Claude session ID found for '$RESUME_ID'." >&2
         echo "The session may not have started successfully."
         exit 1
     fi
+
+    # Resume must run from the same working directory as the original session
+    local working_dir
+    working_dir="$(json_field "$session_line" "working_dir")"
+    if [[ -n "$working_dir" && -d "$working_dir" ]]; then
+        echo "Resuming in: $working_dir"
+        cd "$working_dir"
+    fi
+
+    echo "Resuming Claude session: $claude_session_id"
+    exec claude --resume "$claude_session_id"
 }
 
 find_session_log() {
