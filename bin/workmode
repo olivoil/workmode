@@ -52,9 +52,6 @@ cmd_on() {
         echo "Watcher service started."
     fi
 
-    # Mark as active
-    mkdir -p "$STATE_DIR"
-    echo "active" > "$STATE_DIR/state"
     echo ""
     echo "Workmode is ON."
     cmd_status
@@ -72,18 +69,28 @@ cmd_off() {
     # Disable timers (but don't remove units)
     "$BIN_DIR/workmode-install" disable
 
-    # Mark as inactive
-    echo "inactive" > "$STATE_DIR/state"
     echo ""
     echo "Workmode is OFF."
 }
 
 cmd_status() {
-    local state="inactive"
-    [[ -f "$STATE_DIR/state" ]] && state="$(cat "$STATE_DIR/state")"
+    # Derive active state from systemd — any enabled timer or watcher means active
+    local active=false
+    if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
+        active=true
+    fi
+    for unit_file in "$HOME/.config/systemd/user"/${UNIT_PREFIX}*.timer; do
+        [[ -f "$unit_file" ]] || continue
+        local unit_name
+        unit_name="$(basename "$unit_file")"
+        if systemctl --user is-enabled --quiet "$unit_name" 2>/dev/null; then
+            active=true
+            break
+        fi
+    done
 
     echo ""
-    if [[ "$state" == "active" ]]; then
+    if $active; then
         echo "  Status: 🟢 ACTIVE"
     else
         echo "  Status: 🔴 INACTIVE"
@@ -98,7 +105,7 @@ cmd_status() {
 
     # Timer count
     local timer_count
-    timer_count="$(systemctl --user list-timers --all 2>/dev/null | grep -c "$UNIT_PREFIX" || echo 0)"
+    timer_count="$(systemctl --user list-timers --all 2>/dev/null | grep -c "$UNIT_PREFIX" || true)"
     echo "  Timers: $timer_count"
 
     echo ""
