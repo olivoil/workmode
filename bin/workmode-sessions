@@ -4,22 +4,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/sessions.sh"
 
 STATE_DIR="$(config_state_dir)"
 HISTORY_FILE="$STATE_DIR/history.jsonl"
 LOG_DIR="$STATE_DIR/logs"
-
-# Colors (disabled when piping)
-if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    BLUE='\033[0;34m'
-    RESET='\033[0m'
-    BOLD='\033[1m'
-else
-    RED='' GREEN='' YELLOW='' BLUE='' RESET='' BOLD=''
-fi
 
 usage() {
     cat <<EOF
@@ -30,6 +19,8 @@ Commands:
   logs <id>         Show full output log of a session
   tail <id>         Follow a running session's log (like tail -f)
   resume <id>       Resume a session with claude --resume
+  stop <id>         Gracefully stop a running session (SIGTERM)
+  kill <id>         Force-kill a running session (SIGKILL)
 
 Options:
   --running         Show only running sessions
@@ -41,64 +32,6 @@ Options:
 
 EOF
     exit 0
-}
-
-# Extract JSON field value (simple, no jq dependency)
-json_field() {
-    local json="$1" field="$2"
-    local result
-    result="$(echo "$json" | grep -oP "\"${field}\"\\s*:\\s*\"[^\"]*\"" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true)"
-    echo "$result"
-}
-
-json_field_num() {
-    local json="$1" field="$2"
-    local result
-    result="$(echo "$json" | grep -oP "\"${field}\"\\s*:\\s*[0-9]+" | head -1 | grep -oP '[0-9]+$' || true)"
-    echo "$result"
-}
-
-format_duration() {
-    local seconds="$1"
-    [[ -z "$seconds" || "$seconds" == "0" ]] && echo "—" && return
-    if (( seconds < 60 )); then
-        echo "${seconds}s"
-    elif (( seconds < 3600 )); then
-        echo "$(( seconds / 60 ))m"
-    else
-        echo "$(( seconds / 3600 ))h$(( (seconds % 3600) / 60 ))m"
-    fi
-}
-
-format_time() {
-    local iso_time="$1"
-    [[ -z "$iso_time" ]] && echo "—" && return
-
-    local today
-    today="$(date +%Y-%m-%d)"
-    local day="${iso_time%%T*}"
-    local time="${iso_time#*T}"
-    time="${time%%[-+]*}"  # strip timezone
-    time="${time%:*}"      # HH:MM
-
-    if [[ "$day" == "$today" ]]; then
-        echo "$time today"
-    else
-        echo "$time ${day#*-}"  # MM-DD
-    fi
-}
-
-status_icon() {
-    local icon text color
-    case "$1" in
-        completed) icon="✅"; text="done";  color="$GREEN" ;;
-        running)   icon="🔄"; text="run";   color="$BLUE" ;;
-        stuck)     icon="⏸";  text="stuck"; color="$YELLOW" ;;
-        error)     icon="❌"; text="err";   color="$RED" ;;
-        *)         icon="?";  text="$1";    color="$RESET" ;;
-    esac
-    # Pad the visible text to 8 chars, then wrap in color codes
-    printf "%s %b%-7s%b" "$icon" "$color" "$text" "$RESET"
 }
 
 # --- Parse args ---
@@ -113,6 +46,18 @@ while [[ $# -gt 0 ]]; do
             COMMAND="resume"
             shift
             RESUME_ID="${1:-}"
+            shift || true
+            ;;
+        stop)
+            COMMAND="stop"
+            shift
+            TARGET_ID="${1:-}"
+            shift || true
+            ;;
+        kill)
+            COMMAND="kill"
+            shift
+            TARGET_ID="${1:-}"
             shift || true
             ;;
         logs|log)
@@ -157,48 +102,10 @@ cmd_list() {
         exit 0
     fi
 
-    # Get the latest status for each session (last line per ID wins)
-    local sessions
-    sessions="$(tac "$HISTORY_FILE")"
-
-    # Filter to final status per session (deduplicate by id)
-    local seen_ids=()
     local lines=()
-
     while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        # Skip malformed lines (e.g. partial writes)
-        [[ "$line" == *'"id"'* ]] || continue
-        local id
-        id="$(json_field "$line" "id")"
-        [[ -z "$id" ]] && continue
-
-        # Skip if already seen this id
-        local already_seen=false
-        for seen in "${seen_ids[@]+"${seen_ids[@]}"}"; do
-            if [[ "$seen" == "$id" ]]; then
-                already_seen=true
-                break
-            fi
-        done
-        $already_seen && continue
-
-        seen_ids+=("$id")
-
-        # Apply filter
-        if [[ -n "$FILTER" ]]; then
-            local status
-            status="$(json_field "$line" "status")"
-            [[ "$status" != "$FILTER" ]] && continue
-        fi
-
         lines+=("$line")
-
-        # Count limit
-        if (( COUNT > 0 && ${#lines[@]} >= COUNT )); then
-            break
-        fi
-    done <<< "$sessions"
+    done < <(tac "$HISTORY_FILE" | dedup_sessions "$FILTER" "$COUNT")
 
     if [[ ${#lines[@]} -eq 0 ]]; then
         echo "No sessions found${FILTER:+ with status '$FILTER'}."
@@ -210,54 +117,33 @@ cmd_list() {
         return
     fi
 
-    # Table header — widths: status=10, trigger=14, label=22, started=14, duration=10, id=rest
-    printf "${BOLD}%-10s %-14s %-22s %-14s %-10s %s${RESET}\n" \
-        "STATUS" "TRIGGER" "LABEL" "STARTED" "DURATION" "ID"
+    # Table header
+    printf "${BOLD}%-10s %-14s %-14s %-10s %-14s %s${RESET}\n" \
+        "STATUS" "TRIGGER" "STARTED" "DURATION" "ID" "SUMMARY"
 
     for line in "${lines[@]}"; do
-        local status trigger label started duration short_id
+        local status trigger started duration short_id full_id summary
         status="$(json_field "$line" "status")"
         trigger="$(json_field "$line" "trigger")"
-        label="$(json_field "$line" "label")"
         started="$(json_field "$line" "started")"
         duration="$(json_field_num "$line" "duration")"
         short_id="$(json_field "$line" "short")"
-        # Fall back to full id for older entries without short id
         [[ -z "$short_id" ]] && short_id="$(json_field "$line" "id")"
+        full_id="$(json_field "$line" "id")"
 
-        # status_icon self-pads to ~10 visible chars, so print it raw then the rest
-        printf "%s %-14s %-22s %-14s %-10s %s\n" \
+        summary=""
+        if [[ -f "$LOG_DIR/${full_id}.log" ]]; then
+            summary="$(extract_summary "$LOG_DIR/${full_id}.log" 50)"
+        fi
+
+        printf "%s %-14s %-14s %-10s %-14s %b%s%b\n" \
             "$(status_icon "$status")" \
             "$trigger" \
-            "$label" \
             "$(format_time "$started")" \
             "$(format_duration "$duration")" \
-            "$short_id"
+            "$short_id" \
+            "$DIM" "$summary" "$RESET"
     done
-}
-
-# Resolve a short or full session ID to the history line
-# Usage: resolve_session <id>
-# Prints the matching history line (last entry for that session)
-resolve_session() {
-    local lookup="$1"
-
-    # Try full ID first
-    local match
-    match="$(grep "\"id\":\"${lookup}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
-    if [[ -n "$match" ]]; then
-        echo "$match"
-        return 0
-    fi
-
-    # Try short ID
-    match="$(grep "\"short\":\"${lookup}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
-    if [[ -n "$match" ]]; then
-        echo "$match"
-        return 0
-    fi
-
-    return 1
 }
 
 cmd_resume() {
@@ -267,7 +153,7 @@ cmd_resume() {
     fi
 
     local session_line
-    session_line="$(resolve_session "$RESUME_ID")" || {
+    session_line="$(resolve_session "$RESUME_ID" "$HISTORY_FILE")" || {
         echo "Session '$RESUME_ID' not found." >&2
         exit 1
     }
@@ -293,72 +179,6 @@ cmd_resume() {
     exec claude --resume "$claude_session_id"
 }
 
-find_session_log() {
-    local lookup="$1"
-
-    # Direct log file by full ID
-    if [[ -f "$LOG_DIR/${lookup}.log" ]]; then
-        echo "$LOG_DIR/${lookup}.log"
-        return 0
-    fi
-
-    # Resolve short/full ID to get the full ID for the log file
-    local session_line
-    session_line="$(resolve_session "$lookup")" || return 1
-
-    local full_id
-    full_id="$(json_field "$session_line" "id")"
-    if [[ -n "$full_id" && -f "$LOG_DIR/${full_id}.log" ]]; then
-        echo "$LOG_DIR/${full_id}.log"
-        return 0
-    fi
-
-    return 1
-}
-
-# Parse stream-json log into readable output
-format_session_log() {
-    local log_file="$1"
-
-    while IFS= read -r line; do
-        # Skip empty lines
-        [[ -z "$line" ]] && continue
-
-        # Try to parse stream-json events
-        local type
-        type="$(echo "$line" | grep -oP '"type"\s*:\s*"[^"]*"' | grep -oP '"[^"]*"$' | tr -d '"' 2>/dev/null || true)"
-
-        case "$type" in
-            assistant)
-                # Extract text content from assistant messages
-                local text
-                text="$(echo "$line" | grep -oP '"content"\s*:\s*"[^"]*"' | head -1 | sed 's/"content"\s*:\s*"//;s/"$//' | sed 's/\\n/\n/g' 2>/dev/null || true)"
-                if [[ -n "$text" ]]; then
-                    echo -e "$text"
-                fi
-                ;;
-            tool_use)
-                local tool_name
-                tool_name="$(echo "$line" | grep -oP '"name"\s*:\s*"[^"]*"' | head -1 | grep -oP '"[^"]*"$' | tr -d '"' 2>/dev/null || true)"
-                if [[ -n "$tool_name" ]]; then
-                    echo -e "${BLUE}[tool: ${tool_name}]${RESET}"
-                fi
-                ;;
-            result)
-                local result_text
-                result_text="$(echo "$line" | grep -oP '"result"\s*:\s*"[^"]*"' | head -1 | sed 's/"result"\s*:\s*"//;s/"$//' | sed 's/\\n/\n/g' 2>/dev/null || true)"
-                if [[ -n "$result_text" ]]; then
-                    echo -e "${GREEN}${result_text}${RESET}"
-                fi
-                ;;
-            "")
-                # Not JSON or unrecognized — print raw
-                echo "$line"
-                ;;
-        esac
-    done < "$log_file"
-}
-
 cmd_logs() {
     if [[ -z "${TARGET_ID:-}" ]]; then
         echo "Usage: workmode sessions logs <session-id>" >&2
@@ -366,7 +186,7 @@ cmd_logs() {
     fi
 
     local log_file
-    log_file="$(find_session_log "$TARGET_ID")" || {
+    log_file="$(find_session_log "$TARGET_ID" "$LOG_DIR" "$HISTORY_FILE")" || {
         echo "No log found for session '$TARGET_ID'." >&2
         echo "Logs are stored in: $LOG_DIR/" >&2
         exit 1
@@ -379,6 +199,22 @@ cmd_logs() {
     format_session_log "$log_file"
 }
 
+cmd_stop() {
+    if [[ -z "${TARGET_ID:-}" ]]; then
+        echo "Usage: workmode sessions stop <id>" >&2
+        exit 1
+    fi
+    terminate_session "$TARGET_ID" "stop" "$HISTORY_FILE" "$STATE_DIR"
+}
+
+cmd_kill() {
+    if [[ -z "${TARGET_ID:-}" ]]; then
+        echo "Usage: workmode sessions kill <id>" >&2
+        exit 1
+    fi
+    terminate_session "$TARGET_ID" "kill" "$HISTORY_FILE" "$STATE_DIR"
+}
+
 cmd_tail() {
     if [[ -z "${TARGET_ID:-}" ]]; then
         echo "Usage: workmode sessions tail <session-id>" >&2
@@ -386,7 +222,7 @@ cmd_tail() {
     fi
 
     local log_file
-    log_file="$(find_session_log "$TARGET_ID")" || {
+    log_file="$(find_session_log "$TARGET_ID" "$LOG_DIR" "$HISTORY_FILE")" || {
         echo "No log found for session '$TARGET_ID'." >&2
         echo "Logs are stored in: $LOG_DIR/" >&2
         exit 1
@@ -406,5 +242,7 @@ case "$COMMAND" in
     logs)   cmd_logs ;;
     tail)   cmd_tail ;;
     resume) cmd_resume ;;
+    stop)   cmd_stop ;;
+    kill)   cmd_kill ;;
     *)      usage ;;
 esac

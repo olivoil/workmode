@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# workmode-tui — Interactive session/trigger browser using fzf
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/sessions.sh"
+
+BIN_DIR="$SCRIPT_DIR/bin"
+STATE_DIR="$(config_state_dir)"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+LOG_DIR="$STATE_DIR/logs"
+
+# Check for fzf
+if ! command -v fzf &>/dev/null; then
+    echo "workmode tui requires fzf. Install it with: pacman -S fzf" >&2
+    exit 1
+fi
+
+# --- List generators (called by fzf via --preview / reload) ---
+
+cmd_sessions_list() {
+    [[ -f "$HISTORY_FILE" ]] || exit 0
+
+    while IFS= read -r line; do
+        local short_id status trigger started duration full_id summary
+
+        full_id="$(json_field "$line" "id")"
+        short_id="$(json_field "$line" "short")"
+        [[ -z "$short_id" ]] && short_id="$full_id"
+        status="$(json_field "$line" "status")"
+        trigger="$(json_field "$line" "trigger")"
+        started="$(json_field "$line" "started")"
+        duration="$(json_field_num "$line" "duration")"
+
+        summary=""
+        if [[ -f "$LOG_DIR/${full_id}.log" ]]; then
+            summary="$(extract_summary "$LOG_DIR/${full_id}.log" 50)"
+        fi
+
+        printf "%-16s  %-5s  %-14s  %-14s  %-6s  %s\n" \
+            "$short_id" \
+            "$(status_mark "$status")" \
+            "$trigger" \
+            "$(format_time "$started")" \
+            "$(format_duration "$duration")" \
+            "$summary"
+    done < <(tac "$HISTORY_FILE" | dedup_sessions "" 50)
+}
+
+cmd_triggers_list() {
+    for name in $(config_list_triggers); do
+        local type skill prompt_text label schedule_info last_status
+
+        type="$(config_trigger_field "$name" "type" || echo "?")"
+        skill="$(config_trigger_field "$name" "skill" || true)"
+        prompt_text="$(config_trigger_field "$name" "prompt" || true)"
+
+        label=""
+        if [[ -n "$skill" ]]; then
+            label="$skill"
+        elif [[ -n "$prompt_text" ]]; then
+            label="${prompt_text:0:40}"
+            (( ${#prompt_text} > 40 )) && label="${label}…"
+        fi
+
+        schedule_info=""
+        if [[ "$type" == "timer" ]]; then
+            local interval cron_expr
+            cron_expr="$(config_trigger_field "$name" "cron" || true)"
+            if [[ -n "$cron_expr" ]]; then
+                schedule_info="cron: $cron_expr"
+            else
+                interval="$(config_trigger_field "$name" "interval" || echo "?")"
+                schedule_info="every $interval"
+            fi
+        elif [[ "$type" == "file" ]]; then
+            local watch pattern
+            watch="$(config_trigger_field "$name" "watch" || echo "?")"
+            pattern="$(config_trigger_field "$name" "pattern" || echo "*")"
+            schedule_info="$watch ($pattern)"
+        fi
+
+        # Last session status for this trigger
+        last_status=""
+        if [[ -f "$HISTORY_FILE" ]]; then
+            local last_line
+            last_line="$(grep "\"trigger\":\"${name}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
+            if [[ -n "$last_line" ]]; then
+                last_status="$(status_mark "$(json_field "$last_line" "status")")"
+            fi
+        fi
+
+        printf "%-16s  %-6s  %-18s  %-6s  %s\n" \
+            "$name" "$type" "$schedule_info" "$last_status" "$label"
+    done
+}
+
+# --- Preview handlers (called by fzf --preview) ---
+
+cmd_preview_session() {
+    local short_id="$1"
+
+    local session_line
+    session_line="$(resolve_session "$short_id" "$HISTORY_FILE")" || {
+        echo "Session not found: $short_id"
+        return
+    }
+
+    local full_id status trigger label started duration session_id working_dir
+    full_id="$(json_field "$session_line" "id")"
+    status="$(json_field "$session_line" "status")"
+    trigger="$(json_field "$session_line" "trigger")"
+    label="$(json_field "$session_line" "label")"
+    started="$(json_field "$session_line" "started")"
+    duration="$(json_field_num "$session_line" "duration")"
+    session_id="$(json_field "$session_line" "session_id")"
+    working_dir="$(json_field "$session_line" "working_dir")"
+
+    echo "Session:  $short_id"
+    echo "Full ID:  $full_id"
+    echo "Status:   $status"
+    echo "Trigger:  $trigger"
+    [[ -n "$label" ]] && echo "Label:    $label"
+    echo "Started:  $(format_time "$started")"
+    [[ -n "$duration" && "$duration" != "0" ]] && echo "Duration: $(format_duration "$duration")"
+    [[ -n "$working_dir" ]] && echo "Dir:      $working_dir"
+    [[ -n "$session_id" ]] && echo "Claude:   $session_id"
+    echo "─────────────────────────────────────────"
+    echo ""
+
+    local log_file="$LOG_DIR/${full_id}.log"
+    if [[ -f "$log_file" && -s "$log_file" ]]; then
+        format_session_log "$log_file" | head -200
+    elif [[ "$status" == "running" ]]; then
+        local elapsed=""
+        if [[ -n "$started" ]]; then
+            local start_epoch
+            start_epoch="$(date -d "$started" +%s 2>/dev/null || echo "")"
+            if [[ -n "$start_epoch" ]]; then
+                elapsed="$(format_duration $(( $(date +%s) - start_epoch )))"
+            fi
+        fi
+        echo "Session in progress${elapsed:+ ($elapsed elapsed)}..."
+        echo "Output will appear here once available."
+    else
+        echo "(no log file)"
+    fi
+}
+
+cmd_preview_trigger() {
+    local trigger_name="$1"
+
+    echo "Trigger: $trigger_name"
+    echo "─────────────────────────────────────────"
+
+    local type skill prompt_text permissions working_dir
+    type="$(config_trigger_field "$trigger_name" "type" || echo "?")"
+    skill="$(config_trigger_field "$trigger_name" "skill" || true)"
+    prompt_text="$(config_trigger_field "$trigger_name" "prompt" || true)"
+    permissions="$(config_trigger_field "$trigger_name" "permissions" || echo "default")"
+    working_dir="$(config_trigger_field "$trigger_name" "working_dir" || true)"
+
+    echo "Type:        $type"
+    echo "Permissions: $permissions"
+    [[ -n "$working_dir" ]] && echo "Working dir: $working_dir"
+    [[ -n "$skill" ]] && echo "Skill:       $skill"
+    if [[ -n "$prompt_text" ]]; then
+        echo "Prompt:      ${prompt_text:0:80}"
+        (( ${#prompt_text} > 80 )) && echo "             ${prompt_text:80:80}"
+    fi
+
+    # Type-specific fields
+    if [[ "$type" == "timer" ]]; then
+        local interval cron_expr
+        interval="$(config_trigger_field "$trigger_name" "interval" || true)"
+        cron_expr="$(config_trigger_field "$trigger_name" "cron" || true)"
+        [[ -n "$interval" ]] && echo "Interval:    $interval"
+        [[ -n "$cron_expr" ]] && echo "Cron:        $cron_expr"
+    elif [[ "$type" == "file" ]]; then
+        local watch pattern
+        watch="$(config_trigger_field "$trigger_name" "watch" || true)"
+        pattern="$(config_trigger_field "$trigger_name" "pattern" || true)"
+        [[ -n "$watch" ]] && echo "Watch:       $watch"
+        [[ -n "$pattern" ]] && echo "Pattern:     $pattern"
+    fi
+
+    local cooldown check
+    cooldown="$(config_trigger_field "$trigger_name" "cooldown" || true)"
+    check="$(config_trigger_field "$trigger_name" "check" || true)"
+    [[ -n "$cooldown" ]] && echo "Cooldown:    ${cooldown}s"
+    [[ -n "$check" ]] && echo "Check:       $check"
+
+    echo ""
+    echo "Recent sessions"
+    echo "─────────────────────────────────────────"
+
+    if [[ -f "$HISTORY_FILE" ]]; then
+        local count=0
+        while IFS= read -r line; do
+            local st short started dur
+            st="$(json_field "$line" "status")"
+            short="$(json_field "$line" "short")"
+            [[ -z "$short" ]] && short="$(json_field "$line" "id")"
+            started="$(json_field "$line" "started")"
+            dur="$(json_field_num "$line" "duration")"
+
+            printf "  %-14s  %-8s  %-14s  %s\n" \
+                "$short" "$(status_mark "$st")" \
+                "$(format_time "$started")" \
+                "$(format_duration "${dur:-0}")"
+            (( ++count >= 5 )) && break
+        done < <(grep "\"trigger\":\"${trigger_name}\"" "$HISTORY_FILE" 2>/dev/null \
+            | tac | dedup_sessions "" 5)
+    fi
+}
+
+# Find the line number of a trigger in the config file
+config_trigger_line() {
+    local trigger_name="$1"
+    local line_num=0
+    local in_trigger=false
+
+    while IFS= read -r line; do
+        (( ++line_num ))
+        local stripped="${line%%#*}"
+        stripped="$(echo "$stripped" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+        if [[ "$stripped" == "[[trigger]]" ]]; then
+            in_trigger=true
+            continue
+        elif [[ "$stripped" == "["* ]]; then
+            in_trigger=false
+            continue
+        fi
+
+        if $in_trigger && [[ "$stripped" == "name "* || "$stripped" == "name="* ]]; then
+            local val="${stripped#*=}"
+            val="$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')"
+            if [[ "$val" == "$trigger_name" ]]; then
+                # Return the [[trigger]] line (one before the name line at minimum)
+                echo $(( line_num - 1 ))
+                return 0
+            fi
+            in_trigger=false
+        fi
+    done < "$WORKMODE_CONFIG"
+
+    echo "1"
+}
+
+# --- Main TUI ---
+
+cmd_tui() {
+    local mode="${1:-sessions}"
+    local self
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+
+    while true; do
+        local result=""
+
+        if [[ "$mode" == "sessions" ]]; then
+            result="$( "$self" --sessions-list | fzf \
+                --header=$'SESSIONS  ctrl-t: triggers | enter: log/tail | ctrl-r: resume | ctrl-x: run | ctrl-s: stop | ctrl-k: kill | ctrl-l: refresh\n' \
+                --preview="$self --preview-session {1}" \
+                --preview-window="right:55%:wrap" \
+                --expect="ctrl-r,ctrl-t,ctrl-x,ctrl-s,ctrl-k" \
+                --bind="ctrl-d:preview-half-page-down" \
+                --bind="ctrl-u:preview-half-page-up" \
+                --bind="ctrl-l:reload($self --sessions-list)" \
+                --no-mouse \
+                --height=100% \
+                --layout=reverse \
+                --prompt="sessions > " \
+                --no-info \
+            )" || break  # ESC / ctrl-c
+
+            local key selected selected_id
+            key="$(head -1 <<< "$result")"
+            selected="$(tail -n +2 <<< "$result" | head -1)"
+            selected_id="$(awk '{print $1}' <<< "$selected")"
+
+            case "$key" in
+                ctrl-t)
+                    mode="triggers"
+                    continue
+                    ;;
+                ctrl-r)
+                    if [[ -n "$selected_id" ]]; then
+                        exec "$BIN_DIR/workmode-sessions" resume "$selected_id"
+                    fi
+                    ;;
+                ctrl-s)
+                    if [[ -n "$selected_id" ]]; then
+                        "$BIN_DIR/workmode-sessions" stop "$selected_id" 2>&1 || true
+                        sleep 0.5
+                        continue
+                    fi
+                    ;;
+                ctrl-k)
+                    if [[ -n "$selected_id" ]]; then
+                        "$BIN_DIR/workmode-sessions" kill "$selected_id" 2>&1 || true
+                        sleep 0.5
+                        continue
+                    fi
+                    ;;
+                ctrl-x)
+                    if [[ -n "$selected" ]]; then
+                        local trigger_name
+                        trigger_name="$(awk '{print $3}' <<< "$selected")"
+                        if [[ -n "$trigger_name" ]]; then
+                            exec "$BIN_DIR/workmode-run" --trigger "$trigger_name"
+                        fi
+                    fi
+                    ;;
+                *)
+                    # enter — tail if running, show logs if done
+                    if [[ -n "$selected_id" ]]; then
+                        local session_status
+                        session_status="$(awk '{print $2}' <<< "$selected")"
+                        if [[ "$session_status" == "RUN" ]]; then
+                            "$BIN_DIR/workmode-sessions" tail "$selected_id" || true
+                        else
+                            "$BIN_DIR/workmode-sessions" logs "$selected_id" | less -R
+                        fi
+                        continue
+                    fi
+                    ;;
+            esac
+
+        elif [[ "$mode" == "triggers" ]]; then
+            result="$( "$self" --triggers-list | fzf \
+                --header=$'TRIGGERS  ctrl-t: sessions | enter: run trigger | ctrl-e: edit config | ctrl-l: refresh\n' \
+                --preview="$self --preview-trigger {1}" \
+                --preview-window="right:55%:wrap" \
+                --expect="ctrl-t,ctrl-e" \
+                --bind="ctrl-d:preview-half-page-down" \
+                --bind="ctrl-u:preview-half-page-up" \
+                --bind="ctrl-l:reload($self --triggers-list)" \
+                --no-mouse \
+                --height=100% \
+                --layout=reverse \
+                --prompt="triggers > " \
+                --no-info \
+            )" || break
+
+            local key selected selected_name
+            key="$(head -1 <<< "$result")"
+            selected="$(tail -n +2 <<< "$result" | head -1)"
+            selected_name="$(awk '{print $1}' <<< "$selected")"
+
+            case "$key" in
+                ctrl-t)
+                    mode="sessions"
+                    continue
+                    ;;
+                ctrl-e)
+                    # Open config at the trigger's line
+                    local line_num=1
+                    if [[ -n "$selected_name" ]]; then
+                        line_num="$(config_trigger_line "$selected_name")"
+                    fi
+                    "${EDITOR:-vi}" "+${line_num}" "$WORKMODE_CONFIG"
+                    continue
+                    ;;
+                *)
+                    # enter — run the trigger
+                    if [[ -n "$selected_name" ]]; then
+                        exec "$BIN_DIR/workmode-run" --trigger "$selected_name"
+                    fi
+                    ;;
+            esac
+        fi
+
+        break
+    done
+}
+
+# --- Dispatch ---
+case "${1:-}" in
+    --sessions-list)     cmd_sessions_list ;;
+    --triggers-list)     cmd_triggers_list ;;
+    --preview-session)   shift; cmd_preview_session "$@" ;;
+    --preview-trigger)   shift; cmd_preview_trigger "$@" ;;
+    sessions|triggers)   cmd_tui "$1" ;;
+    *)                   cmd_tui sessions ;;
+esac

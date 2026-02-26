@@ -47,6 +47,9 @@ COOLDOWN="${TRIGGER_cooldown:-0}"
 CHECK_CMD="${TRIGGER_check:-}"
 CRON_EXPR="${TRIGGER_cron:-}"
 TYPE="${TRIGGER_type:-timer}"
+RETRY="${TRIGGER_retry:-never}"          # never | on_error | always
+RETRY_MAX="${TRIGGER_retry_max:-3}"      # 0 = unlimited
+RETRY_DELAY="${TRIGGER_retry_delay:-30}" # seconds between retries
 
 # Either skill or prompt must be set
 [[ -z "$SKILL" && -z "$PROMPT_TEXT" ]] && {
@@ -143,44 +146,93 @@ CLAUDE_CMD+=(--output-format stream-json --verbose)
 # Build the prompt — use explicit prompt if set, otherwise the skill name
 PROMPT="${PROMPT_TEXT:-$SKILL}"
 if [[ -n "$FILE_PATH" ]]; then
-    PROMPT="$PROMPT $FILE_PATH"
+    if [[ "$PROMPT" == *'{file}'* ]]; then
+        # Replace {file} placeholder with actual path
+        PROMPT="${PROMPT//\{file\}/$FILE_PATH}"
+    else
+        # Append file path
+        PROMPT="$PROMPT $FILE_PATH"
+    fi
 fi
 
-# --- Run claude ---
-SESSION_LOG="$LOG_DIR/${SESSION_ID}.log"
-
-CLAUDE_SESSION_ID=""
-EXIT_CODE=0
+# --- Run claude (with retry loop) ---
+ATTEMPT=0
+FINAL_EXIT_CODE=0
 
 cd "$WORKING_DIR"
 
-# Unset CLAUDECODE to allow running from within a Claude session
-# Run claude, capture output, extract session ID
-env -u CLAUDECODE "${CLAUDE_CMD[@]}" "$PROMPT" > "$SESSION_LOG" 2>&1 || EXIT_CODE=$?
+while true; do
+    (( ATTEMPT++ ))
 
-# Try to extract the Claude session ID from stream-json output
-# The session ID appears in the init message
-CLAUDE_SESSION_ID="$(grep -oP '"session_id"\s*:\s*"[^"]*"' "$SESSION_LOG" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true)"
+    SESSION_LOG="$LOG_DIR/${SESSION_ID}.log"
+    CLAUDE_SESSION_ID=""
+    EXIT_CODE=0
 
-# Calculate duration
-ENDED="$(date -Iseconds)"
-DURATION=$(( $(date +%s) - $(date -d "$STARTED" +%s) ))
+    if (( ATTEMPT > 1 )); then
+        # Generate new IDs for retry attempts
+        SESSION_ID="wm-$(date +%s)-$$"
+        SHORT_ID="${TRIGGER_NAME}-$(printf '%04x' $(( (RANDOM * RANDOM) % 65536 )) )"
+        SESSION_LOG="$LOG_DIR/${SESSION_ID}.log"
+        STARTED="$(date -Iseconds)"
+        log_entry "running" ",\"pid\":$$,\"attempt\":${ATTEMPT}"
+        notify_started "$DISPLAY_LABEL" "$TRIGGER_NAME (retry $((ATTEMPT - 1)))"
+    fi
 
-# --- Determine status and log ---
-EXTRA=",\"duration\":${DURATION}"
-[[ -n "$CLAUDE_SESSION_ID" ]] && EXTRA="${EXTRA},\"session_id\":\"${CLAUDE_SESSION_ID}\""
-[[ -n "$FILE_PATH" ]] && EXTRA="${EXTRA},\"file\":\"${FILE_PATH}\""
+    # Unset CLAUDECODE to allow running from within a Claude session
+    # Use stdbuf to disable output buffering so tail -f works on the log file
+    stdbuf -oL env -u CLAUDECODE "${CLAUDE_CMD[@]}" "$PROMPT" > "$SESSION_LOG" 2>&1 || EXIT_CODE=$?
 
-if (( EXIT_CODE == 0 )); then
-    log_entry "completed" "$EXTRA"
-    notify_completed "$DISPLAY_LABEL" "$TRIGGER_NAME" "$DURATION"
-elif (( EXIT_CODE == 2 )); then
-    # Exit code 2 typically means permission/interaction needed
-    log_entry "stuck" "$EXTRA"
-    notify_stuck "$DISPLAY_LABEL" "$TRIGGER_NAME" "${CLAUDE_SESSION_ID:-$SESSION_ID}"
-else
-    log_entry "error" "${EXTRA},\"exit_code\":${EXIT_CODE}"
-    notify_error "$DISPLAY_LABEL" "$TRIGGER_NAME" "$SESSION_ID"
-fi
+    # Try to extract the Claude session ID from stream-json output
+    CLAUDE_SESSION_ID="$(grep -oP '"session_id"\s*:\s*"[^"]*"' "$SESSION_LOG" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true)"
 
-exit $EXIT_CODE
+    # Calculate duration
+    ENDED="$(date -Iseconds)"
+    DURATION=$(( $(date +%s) - $(date -d "$STARTED" +%s) ))
+
+    # --- Determine status and log ---
+    EXTRA=",\"duration\":${DURATION}"
+    [[ -n "$CLAUDE_SESSION_ID" ]] && EXTRA="${EXTRA},\"session_id\":\"${CLAUDE_SESSION_ID}\""
+    [[ -n "$FILE_PATH" ]] && EXTRA="${EXTRA},\"file\":\"${FILE_PATH}\""
+    (( ATTEMPT > 1 )) && EXTRA="${EXTRA},\"attempt\":${ATTEMPT}"
+
+    if (( EXIT_CODE == 0 )); then
+        log_entry "completed" "$EXTRA"
+        notify_completed "$DISPLAY_LABEL" "$TRIGGER_NAME" "$DURATION"
+        FINAL_EXIT_CODE=0
+        break
+    elif (( EXIT_CODE == 2 )); then
+        # Exit code 2 typically means permission/interaction needed — don't retry
+        log_entry "stuck" "$EXTRA"
+        notify_stuck "$DISPLAY_LABEL" "$TRIGGER_NAME" "${CLAUDE_SESSION_ID:-$SESSION_ID}"
+        FINAL_EXIT_CODE=$EXIT_CODE
+        break
+    else
+        log_entry "error" "${EXTRA},\"exit_code\":${EXIT_CODE}"
+        FINAL_EXIT_CODE=$EXIT_CODE
+    fi
+
+    # --- Retry decision ---
+    local should_retry=false 2>/dev/null || true
+    should_retry=false
+    case "$RETRY" in
+        on_error) (( EXIT_CODE != 0 )) && should_retry=true ;;
+        always)   should_retry=true ;;
+        *)        should_retry=false ;;  # "never" or unset
+    esac
+
+    if ! $should_retry; then
+        notify_error "$DISPLAY_LABEL" "$TRIGGER_NAME" "$SESSION_ID"
+        break
+    fi
+
+    if (( RETRY_MAX > 0 && ATTEMPT >= RETRY_MAX )); then
+        echo "Max retries ($RETRY_MAX) reached for '$TRIGGER_NAME'"
+        notify_error "$DISPLAY_LABEL" "$TRIGGER_NAME (max retries)" "$SESSION_ID"
+        break
+    fi
+
+    echo "Retrying '$TRIGGER_NAME' in ${RETRY_DELAY}s (attempt $ATTEMPT)..."
+    sleep "$RETRY_DELAY"
+done
+
+exit $FINAL_EXIT_CODE

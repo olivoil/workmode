@@ -4,6 +4,13 @@
 # Each trigger can use either:
 #   prompt = "..."   — any text you'd type to Claude (most flexible)
 #   skill = "/..."   — shorthand for a Claude Code skill/slash command
+#
+# Retry options (per trigger):
+#   retry = "never"        — don't retry (default)
+#   retry = "on_error"     — retry only when claude exits with an error
+#   retry = "always"       — retry on any exit (error or success)
+#   retry_max = 3          — max attempts (0 = unlimited, default: 3)
+#   retry_delay = 30       — seconds between retries (default: 30)
 
 [general]
 state_dir = "~/.local/share/workmode"
@@ -19,6 +26,9 @@ cooldown = 120
 skill = "/transcribe-meeting"
 permissions = "skip"
 working_dir = "~/Code/github.com/olivoil/obsidian"
+retry = "on_error"
+retry_max = 2
+retry_delay = 60
 
 # Refine daily notes every 2 hours
 [[trigger]]

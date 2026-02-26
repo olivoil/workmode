@@ -26,9 +26,13 @@ Commands:
   uninstall       Remove crontab entries and watcher service
   run <trigger>   Manually run a trigger
   sessions        List sessions: workmode sessions [--running|--stuck|--completed]
+  tui             Interactive session/trigger browser (requires fzf)
+  config          Open config file in \$EDITOR
   logs <id>       Show full output of a session
   tail <id>       Follow a running session's output
   resume <id>     Jump into a session with claude --resume
+  stop <id>       Gracefully stop a running session (SIGTERM)
+  kill <id>       Force-kill a running session (SIGKILL)
   triggers        List configured triggers
   help            Show this help
 
@@ -171,7 +175,7 @@ cmd_sessions() {
 }
 
 # --- Dispatch ---
-COMMAND="${1:-help}"
+COMMAND="${1:-tui}"
 shift || true
 
 case "$COMMAND" in
@@ -182,9 +186,13 @@ case "$COMMAND" in
     uninstall)  "$BIN_DIR/workmode-install" uninstall ;;
     run)        cmd_run "$@" ;;
     sessions)   cmd_sessions "$@" ;;
+    tui)        exec "$BIN_DIR/workmode-tui" "$@" ;;
+    config)     exec "${EDITOR:-vi}" "$WORKMODE_CONFIG" ;;
     logs|log)   cmd_sessions logs "$@" ;;
     tail)       cmd_sessions tail "$@" ;;
     resume)     cmd_sessions resume "$@" ;;
+    stop)       cmd_sessions stop "$@" ;;
+    kill)       cmd_sessions kill "$@" ;;
     triggers)   cmd_triggers ;;
     help|--help|-h) usage ;;
     version|--version|-v) echo "workmode $VERSION" ;;
