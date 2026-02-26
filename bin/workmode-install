@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# workmode-install — Reads config → generates crontab entries + systemd watcher service
+# workmode-install — Reads config → generates systemd user timers + watcher service
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -8,88 +8,125 @@ source "$SCRIPT_DIR/lib/config.sh"
 BIN_DIR="$SCRIPT_DIR/bin"
 STATE_DIR="$(config_state_dir)"
 LOG_DIR="$STATE_DIR/logs"
-CRON_MARKER="# workmode:"
-SERVICE_NAME="workmode-watcher"
+UNIT_PREFIX="workmode-trigger-"
+WATCHER_SERVICE="workmode-watcher"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR" "$SYSTEMD_DIR"
 
-# --- Crontab management ---
+# --- Timer triggers → systemd timers ---
 
-install_crontab() {
-    echo "Installing crontab entries..."
-
-    # Get existing crontab, strip old workmode entries
-    local existing
-    existing="$(crontab -l 2>/dev/null | grep -v "$CRON_MARKER" || true)"
-
-    local new_entries=""
+install_timers() {
+    echo "Installing systemd timers..."
 
     for name in $(config_triggers_by_type "timer"); do
-        local schedule label cron_expr interval
+        local label cron_expr interval on_calendar
 
         # Explicit cron expression takes priority over interval
         cron_expr="$(config_trigger_field "$name" "cron" || true)"
         if [[ -n "$cron_expr" ]]; then
-            schedule="$cron_expr"
+            # Convert cron to OnCalendar format
+            on_calendar="$(cron_to_oncalendar "$cron_expr")"
         else
             interval="$(config_trigger_field "$name" "interval")"
-            schedule="$(interval_to_cron "$interval")"
+            on_calendar="$(interval_to_oncalendar "$interval")"
         fi
 
-        # Label for display
-        label="$(config_trigger_field "$name" "skill" || config_trigger_field "$name" "prompt" | head -c 40 || echo "$name")"
+        label="$(config_trigger_field "$name" "skill" || true)"
+        [[ -z "$label" ]] && label="$(config_trigger_field "$name" "prompt" | head -c 40 || echo "$name")"
 
-        new_entries+="${CRON_MARKER}${name}"$'\n'
-        new_entries+="${schedule} ${BIN_DIR}/workmode-run --trigger ${name} >> ${LOG_DIR}/${name}.log 2>&1"$'\n'
+        local unit_name="${UNIT_PREFIX}${name}"
 
-        echo "  + $name: $schedule → $label"
+        # Generate .service unit
+        cat > "$SYSTEMD_DIR/${unit_name}.service" <<SERVICE
+[Unit]
+Description=Workmode trigger: ${name}
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_DIR}/workmode-run --trigger ${name}
+StandardOutput=append:${LOG_DIR}/${name}.log
+StandardError=append:${LOG_DIR}/${name}.log
+SERVICE
+
+        # Generate .timer unit
+        cat > "$SYSTEMD_DIR/${unit_name}.timer" <<TIMER
+[Unit]
+Description=Workmode timer: ${name}
+
+[Timer]
+${on_calendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+        echo "  + $name: $on_calendar → $label"
     done
 
-    if [[ -n "$new_entries" ]]; then
-        echo "${existing}"$'\n'"${new_entries}" | crontab -
-    else
-        echo "$existing" | crontab -
-    fi
-
-    echo "Crontab updated."
+    systemctl --user daemon-reload
+    echo "Timers installed."
 }
 
-uninstall_crontab() {
-    echo "Removing crontab entries..."
-    local existing
-    existing="$(crontab -l 2>/dev/null || true)"
+uninstall_timers() {
+    echo "Removing systemd timers..."
 
-    # Remove workmode lines and the marker comment lines
-    echo "$existing" | grep -v "$CRON_MARKER" | crontab -
-    echo "Crontab cleaned."
+    for unit_file in "$SYSTEMD_DIR"/${UNIT_PREFIX}*.timer; do
+        [[ -f "$unit_file" ]] || continue
+        local unit_name
+        unit_name="$(basename "$unit_file")"
+        local service_name="${unit_name%.timer}.service"
+
+        systemctl --user stop "$unit_name" 2>/dev/null || true
+        systemctl --user disable "$unit_name" 2>/dev/null || true
+        rm -f "$SYSTEMD_DIR/$unit_name" "$SYSTEMD_DIR/$service_name"
+        echo "  - removed $unit_name"
+    done
+
+    systemctl --user daemon-reload
+    echo "Timers removed."
 }
 
-# --- Systemd watcher service ---
+enable_timers() {
+    for name in $(config_triggers_by_type "timer"); do
+        local unit_name="${UNIT_PREFIX}${name}.timer"
+        systemctl --user enable "$unit_name" 2>/dev/null || true
+        systemctl --user start "$unit_name" 2>/dev/null || true
+    done
+}
+
+disable_timers() {
+    for unit_file in "$SYSTEMD_DIR"/${UNIT_PREFIX}*.timer; do
+        [[ -f "$unit_file" ]] || continue
+        local unit_name
+        unit_name="$(basename "$unit_file")"
+        systemctl --user stop "$unit_name" 2>/dev/null || true
+        systemctl --user disable "$unit_name" 2>/dev/null || true
+    done
+}
+
+# --- File triggers → inotifywait watcher service ---
 
 install_watcher_service() {
     local has_file_triggers=false
 
-    # Collect all watch directories and patterns
     local watch_dirs=()
-    local trigger_names=()
 
     for name in $(config_triggers_by_type "file"); do
         has_file_triggers=true
         local watch_dir
         watch_dir="$(config_trigger_field "$name" "watch")"
         watch_dirs+=("$watch_dir")
-        trigger_names+=("$name")
     done
 
     if ! $has_file_triggers; then
         echo "No file triggers configured, skipping watcher service."
-        # Remove service if it exists
-        if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
-            systemctl --user stop "$SERVICE_NAME"
-            systemctl --user disable "$SERVICE_NAME"
+        if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
+            systemctl --user stop "$WATCHER_SERVICE"
+            systemctl --user disable "$WATCHER_SERVICE"
         fi
-        rm -f "$SYSTEMD_DIR/${SERVICE_NAME}.service"
+        rm -f "$SYSTEMD_DIR/${WATCHER_SERVICE}.service"
         return
     fi
 
@@ -121,7 +158,6 @@ while IFS= read -r filepath; do
     filename="\$(basename "\$filepath")"
 WATCHER_BODY
 
-    # Add pattern matching for each file trigger
     for name in $(config_triggers_by_type "file"); do
         local pattern watch_dir
         pattern="$(config_trigger_field "$name" "pattern")"
@@ -139,11 +175,9 @@ MATCH_BLOCK
     echo "done" >> "$watcher_script"
     chmod +x "$watcher_script"
 
-    # Generate systemd service
-    cat > "$SYSTEMD_DIR/${SERVICE_NAME}.service" <<SERVICE
+    cat > "$SYSTEMD_DIR/${WATCHER_SERVICE}.service" <<SERVICE
 [Unit]
 Description=Workmode file watcher
-After=default.target
 
 [Service]
 Type=simple
@@ -160,32 +194,90 @@ SERVICE
 }
 
 uninstall_watcher_service() {
-    if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
-        systemctl --user stop "$SERVICE_NAME"
+    if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
+        systemctl --user stop "$WATCHER_SERVICE"
     fi
-    if systemctl --user is-enabled "$SERVICE_NAME" &>/dev/null; then
-        systemctl --user disable "$SERVICE_NAME"
+    if systemctl --user is-enabled "$WATCHER_SERVICE" &>/dev/null; then
+        systemctl --user disable "$WATCHER_SERVICE"
     fi
-    rm -f "$SYSTEMD_DIR/${SERVICE_NAME}.service"
+    rm -f "$SYSTEMD_DIR/${WATCHER_SERVICE}.service"
     systemctl --user daemon-reload 2>/dev/null || true
     echo "Watcher service removed."
+}
+
+# --- Helpers: interval/cron → OnCalendar ---
+
+# Convert interval like "2h", "15m" to systemd timer directives
+# Returns two lines: OnActiveSec (first run) + OnUnitActiveSec (repeat)
+interval_to_oncalendar() {
+    local interval="$1"
+    local num="${interval%[hms]*}"
+    local unit="${interval##*[0-9]}"
+    local sd_unit
+
+    case "$unit" in
+        h) sd_unit="${num}h" ;;
+        m) sd_unit="${num}min" ;;
+        s) sd_unit="${num}s" ;;
+        *)  sd_unit="${num}min" ;;
+    esac
+
+    # OnActiveSec triggers the first run after the timer is started
+    # OnUnitActiveSec repeats after each service activation
+    printf "OnActiveSec=%s\nOnUnitActiveSec=%s" "$sd_unit" "$sd_unit"
+}
+
+# Convert 5-field cron expression to systemd OnCalendar
+# e.g. "45 8 * * 1-5" → "OnCalendar=Mon..Fri *-*-* 08:45:00"
+cron_to_oncalendar() {
+    local cron="$1"
+    local minute hour dom month dow
+    read -r minute hour dom month dow <<< "$cron"
+
+    # Day of week mapping
+    local sd_dow="*"
+    if [[ "$dow" != "*" ]]; then
+        sd_dow="$(echo "$dow" | sed \
+            -e 's/0/Sun/g' -e 's/1/Mon/g' -e 's/2/Tue/g' \
+            -e 's/3/Wed/g' -e 's/4/Thu/g' -e 's/5/Fri/g' \
+            -e 's/6/Sat/g' -e 's/7/Sun/g' -e 's/-/../g')"
+    fi
+
+    # Pad hour/minute
+    [[ "$hour" != "*" && ${#hour} -eq 1 ]] && hour="0${hour}"
+    [[ "$minute" != "*" && ${#minute} -eq 1 ]] && minute="0${minute}"
+
+    local date_part="*-${month}-${dom}"
+    [[ "$month" == "*" && "$dom" == "*" ]] && date_part="*-*-*"
+
+    local calendar="${sd_dow} ${date_part} ${hour}:${minute}:00"
+    # Clean up: remove leading "* " if dow is *
+    [[ "$sd_dow" == "*" ]] && calendar="${date_part} ${hour}:${minute}:00"
+
+    echo "OnCalendar=${calendar}"
 }
 
 # --- Main ---
 
 case "${1:-install}" in
     install)
-        install_crontab
+        install_timers
         install_watcher_service
         echo ""
         echo "Run 'workmode on' to activate triggers."
         ;;
     uninstall)
-        uninstall_crontab
+        uninstall_timers
         uninstall_watcher_service
         ;;
+    enable)
+        enable_timers
+        ;;
+    disable)
+        disable_timers
+        ;;
     *)
-        echo "Usage: workmode-install [install|uninstall]"
+        echo "Usage: workmode-install [install|uninstall|enable|disable]"
         exit 1
         ;;
 esac

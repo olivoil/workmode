@@ -7,7 +7,8 @@ source "$SCRIPT_DIR/lib/config.sh"
 
 BIN_DIR="$SCRIPT_DIR/bin"
 STATE_DIR="$(config_state_dir)"
-SERVICE_NAME="workmode-watcher"
+WATCHER_SERVICE="workmode-watcher"
+UNIT_PREFIX="workmode-trigger-"
 
 VERSION="0.1.0"
 
@@ -38,14 +39,18 @@ cmd_on() {
     # Install first if not already
     "$BIN_DIR/workmode-install" install
 
+    # Enable and start timers
+    "$BIN_DIR/workmode-install" enable
+
     # Enable and start watcher if service exists
-    if systemctl --user cat "$SERVICE_NAME" &>/dev/null; then
-        systemctl --user enable "$SERVICE_NAME" 2>/dev/null || true
-        systemctl --user start "$SERVICE_NAME" 2>/dev/null || true
+    if systemctl --user cat "$WATCHER_SERVICE" &>/dev/null; then
+        systemctl --user enable "$WATCHER_SERVICE" 2>/dev/null || true
+        systemctl --user start "$WATCHER_SERVICE" 2>/dev/null || true
         echo "Watcher service started."
     fi
 
     # Mark as active
+    mkdir -p "$STATE_DIR"
     echo "active" > "$STATE_DIR/state"
     echo ""
     echo "Workmode is ON."
@@ -56,13 +61,13 @@ cmd_off() {
     echo "Deactivating workmode..."
 
     # Stop watcher service
-    if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
-        systemctl --user stop "$SERVICE_NAME"
+    if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
+        systemctl --user stop "$WATCHER_SERVICE"
         echo "Watcher service stopped."
     fi
 
-    # Remove crontab entries
-    "$BIN_DIR/workmode-install" uninstall
+    # Disable timers (but don't remove units)
+    "$BIN_DIR/workmode-install" disable
 
     # Mark as inactive
     echo "inactive" > "$STATE_DIR/state"
@@ -82,16 +87,16 @@ cmd_status() {
     fi
 
     # Watcher service status
-    if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
+    if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
         echo "  Watcher: running"
     else
         echo "  Watcher: stopped"
     fi
 
-    # Crontab entries
-    local cron_count
-    cron_count="$(crontab -l 2>/dev/null | grep -c "# workmode:" || echo 0)"
-    echo "  Crontab entries: $cron_count"
+    # Timer count
+    local timer_count
+    timer_count="$(systemctl --user list-timers --all 2>/dev/null | grep -c "$UNIT_PREFIX" || echo 0)"
+    echo "  Timers: $timer_count"
 
     echo ""
     cmd_triggers
