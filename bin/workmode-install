@@ -399,6 +399,11 @@ case "${1:-install}" in
         install_config_watcher
         install_skill
         install_completions
+        # Build Go TUI if go is available
+        if command -v go &>/dev/null && [[ -f "$SCRIPT_DIR/tui/go.mod" ]]; then
+            echo "Building TUI binary..."
+            (cd "$SCRIPT_DIR/tui" && go build -o "$BIN_DIR/workmode-tui" .) && echo "  workmode-tui built" || echo "  TUI build skipped (go build failed)"
+        fi
         echo ""
         echo "Run 'workmode on' to activate triggers."
         ;;

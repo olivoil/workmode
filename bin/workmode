@@ -189,7 +189,12 @@ case "$COMMAND" in
     config)       source "$SCRIPT_DIR/lib/cmd/config.sh"; dispatch_config "$@" ;;
     install)      cmd_install ;;
     uninstall)    cmd_uninstall ;;
-    tui)          source "$SCRIPT_DIR/lib/cmd/tui.sh"; cmd_tui "$@" ;;
+    tui)
+        if [[ -x "$SCRIPT_DIR/bin/workmode-tui" ]]; then
+            exec "$SCRIPT_DIR/bin/workmode-tui" "$@"
+        else
+            source "$SCRIPT_DIR/lib/cmd/tui.sh"; cmd_tui "$@"
+        fi ;;
     completions)  source "$SCRIPT_DIR/lib/cmd/completions.sh"; dispatch_completions "$@" ;;
     help|--help|-h)       usage ;;
     version|--version|-v) echo "workmode $VERSION" ;;
