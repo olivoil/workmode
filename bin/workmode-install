@@ -159,17 +159,36 @@ while IFS= read -r filepath; do
 WATCHER_BODY
 
     for name in $(config_triggers_by_type "file"); do
-        local pattern watch_dir
+        local pattern watch_dir settle
         pattern="$(config_trigger_field "$name" "pattern")"
         watch_dir="$(config_trigger_field "$name" "watch")"
+        settle="$(config_trigger_field "$name" "settle" 2>/dev/null || echo "0")"
 
-        cat >> "$watcher_script" <<MATCH_BLOCK
+        if [[ "$settle" -gt 0 ]] 2>/dev/null; then
+            cat >> "$watcher_script" <<MATCH_BLOCK
+    # Trigger: $name (settle: ${settle}s — wait for file to stop changing)
+    if [[ "\$filepath" == ${watch_dir}/* ]] && [[ "\$filename" == $pattern ]]; then
+        (
+            while true; do
+                size_before=\$(stat -c%s "\$filepath" 2>/dev/null || echo 0)
+                sleep $settle
+                size_after=\$(stat -c%s "\$filepath" 2>/dev/null || echo 0)
+                [[ "\$size_before" == "\$size_after" ]] && break
+            done
+            "$BIN_DIR/workmode-run" --trigger "$name" --file "\$filepath"
+        ) &
+        continue
+    fi
+MATCH_BLOCK
+        else
+            cat >> "$watcher_script" <<MATCH_BLOCK
     # Trigger: $name
     if [[ "\$filepath" == ${watch_dir}/* ]] && [[ "\$filename" == $pattern ]]; then
         "$BIN_DIR/workmode-run" --trigger "$name" --file "\$filepath" &
         continue
     fi
 MATCH_BLOCK
+        fi
     done
 
     echo "done" >> "$watcher_script"
@@ -244,6 +263,81 @@ uninstall_config_watcher() {
     echo "Config watcher removed."
 }
 
+# --- Claude Code skill symlink ---
+
+install_skill() {
+    local skill_dir="$HOME/.claude/skills/workmode"
+    local skill_src="$SCRIPT_DIR/skill"
+
+    if [[ -d "$skill_src" ]]; then
+        mkdir -p "$(dirname "$skill_dir")"
+        if [[ -L "$skill_dir" ]]; then
+            local current_target
+            current_target="$(readlink "$skill_dir")"
+            if [[ "$current_target" == "$skill_src" ]]; then
+                return  # Already correct
+            fi
+            rm -f "$skill_dir"
+        elif [[ -d "$skill_dir" ]]; then
+            echo "  Skill directory exists and is not a symlink: $skill_dir" >&2
+            return
+        fi
+        ln -sf "$skill_src" "$skill_dir"
+        echo "Skill installed: $skill_dir → $skill_src"
+    fi
+}
+
+uninstall_skill() {
+    local skill_dir="$HOME/.claude/skills/workmode"
+    if [[ -L "$skill_dir" ]]; then
+        rm -f "$skill_dir"
+        echo "Skill symlink removed."
+    fi
+}
+
+# --- Shell completions ---
+
+install_completions() {
+    local workmode_bin="$BIN_DIR/workmode"
+
+    # Bash completions
+    local bash_comp_dir="$HOME/.local/share/bash-completion/completions"
+    mkdir -p "$bash_comp_dir"
+    bash "$workmode_bin" completions bash > "$bash_comp_dir/workmode"
+    echo "Bash completions installed: $bash_comp_dir/workmode"
+
+    # Zsh completions (if zsh config dir exists)
+    if [[ -f "$HOME/.zshrc" ]]; then
+        local zsh_comp_dir="$HOME/.local/share/zsh/site-functions"
+        mkdir -p "$zsh_comp_dir"
+        bash "$workmode_bin" completions zsh > "$zsh_comp_dir/_workmode"
+        # Ensure the dir is in fpath
+        if ! grep -q 'workmode.*fpath\|site-functions.*fpath\|fpath.*site-functions' "$HOME/.zshrc" 2>/dev/null; then
+            if ! grep -q "$zsh_comp_dir" "$HOME/.zshrc" 2>/dev/null; then
+                echo "Zsh completions installed: $zsh_comp_dir/_workmode"
+                echo "  Add to .zshrc: fpath=($zsh_comp_dir \$fpath)"
+            fi
+        else
+            echo "Zsh completions installed: $zsh_comp_dir/_workmode"
+        fi
+    fi
+
+    # Fish completions (if fish config dir exists)
+    if [[ -d "$HOME/.config/fish" ]]; then
+        local fish_comp_dir="$HOME/.config/fish/completions"
+        mkdir -p "$fish_comp_dir"
+        bash "$workmode_bin" completions fish > "$fish_comp_dir/workmode.fish"
+        echo "Fish completions installed: $fish_comp_dir/workmode.fish"
+    fi
+}
+
+uninstall_completions() {
+    rm -f "$HOME/.local/share/bash-completion/completions/workmode"
+    rm -f "$HOME/.local/share/zsh/site-functions/_workmode"
+    rm -f "$HOME/.config/fish/completions/workmode.fish"
+    echo "Shell completions removed."
+}
+
 # --- Helpers: interval/cron → OnCalendar ---
 
 # Convert interval like "2h", "15m" to systemd timer directives
@@ -303,6 +397,8 @@ case "${1:-install}" in
         install_timers
         install_watcher_service
         install_config_watcher
+        install_skill
+        install_completions
         echo ""
         echo "Run 'workmode on' to activate triggers."
         ;;
@@ -310,6 +406,8 @@ case "${1:-install}" in
         uninstall_timers
         uninstall_watcher_service
         uninstall_config_watcher
+        uninstall_skill
+        uninstall_completions
         ;;
     enable)
         enable_timers

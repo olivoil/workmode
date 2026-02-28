@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# workmode — Main CLI entrypoint
+# workmode — Main CLI entrypoint (two-level dispatcher)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/cli.sh"
+source "$SCRIPT_DIR/lib/sessions.sh"
 
 BIN_DIR="$SCRIPT_DIR/bin"
 STATE_DIR="$(config_state_dir)"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+LOG_DIR="$STATE_DIR/logs"
 WATCHER_SERVICE="workmode-watcher"
 CONFIG_WATCHER="workmode-config-watcher"
 UNIT_PREFIX="workmode-trigger-"
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 usage() {
     cat <<EOF
@@ -19,45 +23,60 @@ workmode $VERSION — Automated Claude Code skill runner
 
 Usage: workmode <command> [options]
 
-Commands:
-  on              Activate all triggers (crontab + watcher)
-  off             Deactivate all triggers
-  status          Show current state and trigger list
-  install         Read config and install crontab + watcher service
-  uninstall       Remove crontab entries and watcher service
-  run <trigger>   Manually run a trigger
-  sessions        List sessions: workmode sessions [--running|--stuck|--completed]
-  tui             Interactive session/trigger browser (requires fzf)
-  config          Open config file in \$EDITOR
-  logs <id>       Show full output of a session
-  tail <id>       Follow a running session's output
-  resume <id>     Jump into a session with claude --resume
-  stop <id>       Gracefully stop a running session (SIGTERM)
-  kill <id>       Force-kill a running session (SIGKILL)
-  triggers        List configured triggers
-  help            Show this help
+Lifecycle:
+  on                    Activate all triggers
+  off                   Deactivate all triggers
+  status [--json]       Show current state and summary
+
+Triggers:
+  trigger list [--json]          List configured triggers
+  trigger show <name> [--json]   Show trigger config
+  trigger run <name>             Manually run a trigger
+  trigger enable <name>          Enable a trigger's systemd unit
+  trigger disable <name>         Disable a trigger's systemd unit
+
+Sessions:
+  session list [--json] [--running|--stuck|--completed]
+  session logs <id>              Show session output
+  session tail <id>              Follow running session
+  session resume <id>            Resume interactive session
+  session stop <id>              Graceful stop (SIGTERM)
+  session kill <id>              Force kill (SIGKILL)
+
+Config:
+  config show [--json]           Print parsed config
+  config edit                    Open in \$EDITOR
+  config validate                Check syntax + required fields
+  config apply                   Validate + reinstall systemd units
+  config path                    Print config file path
+
+System:
+  install                        Install/update systemd units
+  uninstall                      Remove systemd units
+  tui                            Interactive browser (default when no args)
+  completions bash|zsh|fish      Generate shell completions
+
+  help                           Show this help
+  version                        Show version
 
 EOF
     exit 0
 }
 
+# --- Top-level commands ---
+
 cmd_on() {
     echo "Activating workmode..."
 
-    # Install first if not already
     "$BIN_DIR/workmode-install" install
-
-    # Enable and start timers
     "$BIN_DIR/workmode-install" enable
 
-    # Enable and start watcher if service exists
     if systemctl --user cat "$WATCHER_SERVICE" &>/dev/null; then
         systemctl --user enable "$WATCHER_SERVICE" 2>/dev/null || true
         systemctl --user start "$WATCHER_SERVICE" 2>/dev/null || true
         echo "Watcher service started."
     fi
 
-    # Enable and start config watcher
     if systemctl --user cat "${CONFIG_WATCHER}.path" &>/dev/null; then
         systemctl --user enable "${CONFIG_WATCHER}.path" 2>/dev/null || true
         systemctl --user start "${CONFIG_WATCHER}.path" 2>/dev/null || true
@@ -72,19 +91,16 @@ cmd_on() {
 cmd_off() {
     echo "Deactivating workmode..."
 
-    # Stop watcher service
     if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
         systemctl --user stop "$WATCHER_SERVICE"
         echo "Watcher service stopped."
     fi
 
-    # Stop config watcher
     if systemctl --user is-active "${CONFIG_WATCHER}.path" &>/dev/null; then
         systemctl --user stop "${CONFIG_WATCHER}.path"
         echo "Config watcher stopped."
     fi
 
-    # Disable timers (but don't remove units)
     "$BIN_DIR/workmode-install" disable
 
     echo ""
@@ -92,7 +108,9 @@ cmd_off() {
 }
 
 cmd_status() {
-    # Derive active state from systemd — any enabled timer or watcher means active
+    parse_global_flags "$@"
+
+    # Derive active state from systemd
     local active=false
     if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
         active=true
@@ -107,85 +125,55 @@ cmd_status() {
         fi
     done
 
-    echo ""
-    if $active; then
-        echo "  Status: 🟢 ACTIVE"
-    else
-        echo "  Status: 🔴 INACTIVE"
+    local watcher_running=false
+    systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null && watcher_running=true
+
+    local timer_count
+    timer_count="$(systemctl --user list-timers --all 2>/dev/null | grep -c "$UNIT_PREFIX" || true)"
+
+    local trigger_count=0
+    for _ in $(config_list_triggers); do
+        (( ++trigger_count ))
+    done
+
+    if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        local fields
+        fields="$(json_field_bool "active" "$active")"
+        fields+=",$(json_field_bool "watcher" "$watcher_running")"
+        fields+=",$(json_field_num "timers" "$timer_count")"
+        fields+=",$(json_field_num "triggers" "$trigger_count")"
+        json_object "$fields"
+        echo
+        return
     fi
 
-    # Watcher service status
-    if systemctl --user is-active "$WATCHER_SERVICE" &>/dev/null; then
+    echo ""
+    if $active; then
+        echo "  Status: ACTIVE"
+    else
+        echo "  Status: INACTIVE"
+    fi
+
+    if $watcher_running; then
         echo "  Watcher: running"
     else
         echo "  Watcher: stopped"
     fi
 
-    # Timer count
-    local timer_count
-    timer_count="$(systemctl --user list-timers --all 2>/dev/null | grep -c "$UNIT_PREFIX" || true)"
     echo "  Timers: $timer_count"
-
     echo ""
-    cmd_triggers
+
+    # Show triggers summary
+    source "$SCRIPT_DIR/lib/cmd/trigger.sh"
+    cmd_trigger_list
 }
 
-cmd_triggers() {
-    echo "Configured triggers:"
-    echo ""
-    printf "  %-14s %-8s %-10s %-28s %s\n" "NAME" "TYPE" "PERMS" "PROMPT/SKILL" "SCHEDULE/WATCH"
-    echo "  ────────────── ──────── ────────── ──────────────────────────── ──────────────────────"
-
-    for name in $(config_list_triggers); do
-        local type skill prompt_text label permissions interval watch pattern
-        type="$(config_trigger_field "$name" "type" || echo "?")"
-        skill="$(config_trigger_field "$name" "skill" || true)"
-        prompt_text="$(config_trigger_field "$name" "prompt" || true)"
-        permissions="$(config_trigger_field "$name" "permissions" || echo "default")"
-
-        # Show skill if set, otherwise truncated prompt
-        if [[ -n "$skill" ]]; then
-            label="$skill"
-        elif [[ -n "$prompt_text" ]]; then
-            label="${prompt_text:0:26}"
-            (( ${#prompt_text} > 26 )) && label="${label}…"
-        else
-            label="?"
-        fi
-
-        local schedule_info=""
-        if [[ "$type" == "timer" ]]; then
-            local cron_expr
-            cron_expr="$(config_trigger_field "$name" "cron" || true)"
-            if [[ -n "$cron_expr" ]]; then
-                schedule_info="cron: $cron_expr"
-            else
-                interval="$(config_trigger_field "$name" "interval" || echo "?")"
-                schedule_info="every $interval"
-            fi
-        elif [[ "$type" == "file" ]]; then
-            watch="$(config_trigger_field "$name" "watch" || echo "?")"
-            pattern="$(config_trigger_field "$name" "pattern" || echo "*")"
-            schedule_info="$watch ($pattern)"
-        fi
-
-        printf "  %-14s %-8s %-10s %-28s %s\n" \
-            "$name" "$type" "$permissions" "$label" "$schedule_info"
-    done
-    echo ""
+cmd_install() {
+    "$BIN_DIR/workmode-install" install
 }
 
-cmd_run() {
-    local trigger_name="${1:-}"
-    if [[ -z "$trigger_name" ]]; then
-        echo "Usage: workmode run <trigger-name>" >&2
-        exit 1
-    fi
-    exec "$BIN_DIR/workmode-run" --trigger "$trigger_name"
-}
-
-cmd_sessions() {
-    exec "$BIN_DIR/workmode-sessions" "$@"
+cmd_uninstall() {
+    "$BIN_DIR/workmode-install" uninstall
 }
 
 # --- Dispatch ---
@@ -193,26 +181,19 @@ COMMAND="${1:-tui}"
 shift || true
 
 case "$COMMAND" in
-    on)         cmd_on ;;
-    off)        cmd_off ;;
-    status)     cmd_status ;;
-    install)    "$BIN_DIR/workmode-install" install ;;
-    uninstall)  "$BIN_DIR/workmode-install" uninstall ;;
-    run)        cmd_run "$@" ;;
-    sessions)   cmd_sessions "$@" ;;
-    tui)        exec "$BIN_DIR/workmode-tui" "$@" ;;
-    config)     exec "${EDITOR:-vi}" "$WORKMODE_CONFIG" ;;
-    logs|log)   cmd_sessions logs "$@" ;;
-    tail)       cmd_sessions tail "$@" ;;
-    resume)     cmd_sessions resume "$@" ;;
-    stop)       cmd_sessions stop "$@" ;;
-    kill)       cmd_sessions kill "$@" ;;
-    triggers)   cmd_triggers ;;
-    help|--help|-h) usage ;;
+    on)           cmd_on ;;
+    off)          cmd_off ;;
+    status)       cmd_status "$@" ;;
+    trigger)      source "$SCRIPT_DIR/lib/cmd/trigger.sh"; dispatch_trigger "$@" ;;
+    session)      source "$SCRIPT_DIR/lib/cmd/session.sh"; dispatch_session "$@" ;;
+    config)       source "$SCRIPT_DIR/lib/cmd/config.sh"; dispatch_config "$@" ;;
+    install)      cmd_install ;;
+    uninstall)    cmd_uninstall ;;
+    tui)          source "$SCRIPT_DIR/lib/cmd/tui.sh"; cmd_tui "$@" ;;
+    completions)  source "$SCRIPT_DIR/lib/cmd/completions.sh"; dispatch_completions "$@" ;;
+    help|--help|-h)       usage ;;
     version|--version|-v) echo "workmode $VERSION" ;;
     *)
-        echo "Unknown command: $COMMAND" >&2
-        echo "Run 'workmode help' for usage." >&2
-        exit 1
+        die "Unknown command: $COMMAND. Run 'workmode help' for usage."
         ;;
 esac

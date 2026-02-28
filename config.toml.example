@@ -5,6 +5,10 @@
 #   prompt = "..."   — any text you'd type to Claude (most flexible)
 #   skill = "/..."   — shorthand for a Claude Code skill/slash command
 #
+# File trigger options:
+#   settle = 10            — wait N seconds for file size to stabilize before triggering
+#                            (useful for screen recordings that create the file at start)
+#
 # Retry options (per trigger):
 #   retry = "never"        — don't retry (default)
 #   retry = "on_error"     — retry only when claude exits with an error
@@ -22,6 +26,7 @@ name = "transcribe"
 type = "file"
 watch = "~/Videos"
 pattern = "screenrecording-*.mp4"
+settle = 10
 cooldown = 120
 skill = "/transcribe-meeting"
 permissions = "skip"

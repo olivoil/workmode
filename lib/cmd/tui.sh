@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# workmode-tui — Interactive session/trigger browser using fzf
-set -euo pipefail
+# lib/cmd/tui.sh — Interactive session/trigger browser using fzf
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-source "$SCRIPT_DIR/lib/config.sh"
-source "$SCRIPT_DIR/lib/sessions.sh"
-
-BIN_DIR="$SCRIPT_DIR/bin"
-STATE_DIR="$(config_state_dir)"
-HISTORY_FILE="$STATE_DIR/history.jsonl"
-LOG_DIR="$STATE_DIR/logs"
+# JSON field extractors (aliased to avoid conflict with cli.sh json_field)
+sess_json_field() {
+    local json="$1" field="$2"
+    echo "$json" | grep -oP "\"${field}\"\\s*:\\s*\"[^\"]*\"" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true
+}
+sess_json_field_num() {
+    local json="$1" field="$2"
+    echo "$json" | grep -oP "\"${field}\"\\s*:\\s*[0-9]+" | head -1 | grep -oP '[0-9]+$' || true
+}
 
 # Check for fzf
 if ! command -v fzf &>/dev/null; then
@@ -19,19 +19,19 @@ fi
 
 # --- List generators (called by fzf via --preview / reload) ---
 
-cmd_sessions_list() {
+_tui_sessions_list() {
     [[ -f "$HISTORY_FILE" ]] || exit 0
 
     while IFS= read -r line; do
         local short_id status trigger started duration full_id summary
 
-        full_id="$(json_field "$line" "id")"
-        short_id="$(json_field "$line" "short")"
+        full_id="$(sess_json_field "$line" "id")"
+        short_id="$(sess_json_field "$line" "short")"
         [[ -z "$short_id" ]] && short_id="$full_id"
-        status="$(json_field "$line" "status")"
-        trigger="$(json_field "$line" "trigger")"
-        started="$(json_field "$line" "started")"
-        duration="$(json_field_num "$line" "duration")"
+        status="$(sess_json_field "$line" "status")"
+        trigger="$(sess_json_field "$line" "trigger")"
+        started="$(sess_json_field "$line" "started")"
+        duration="$(sess_json_field_num "$line" "duration")"
 
         summary=""
         if [[ -f "$LOG_DIR/${full_id}.log" && -s "$LOG_DIR/${full_id}.log" ]]; then
@@ -46,13 +46,13 @@ cmd_sessions_list() {
         fi
         if [[ -z "$summary" ]]; then
             local error_hint
-            error_hint="$(json_field "$line" "error")"
+            error_hint="$(sess_json_field "$line" "error")"
             if [[ -n "$error_hint" ]]; then
                 summary="$error_hint"
                 (( ${#summary} > 50 )) && summary="${summary:0:49}…"
             else
                 local exit_code
-                exit_code="$(json_field_num "$line" "exit_code")"
+                exit_code="$(sess_json_field_num "$line" "exit_code")"
                 if [[ -n "$exit_code" && "$exit_code" != "0" ]]; then
                     summary="exit code $exit_code"
                 fi
@@ -69,7 +69,7 @@ cmd_sessions_list() {
     done < <(tac "$HISTORY_FILE" | dedup_sessions "" 50)
 }
 
-cmd_triggers_list() {
+_tui_triggers_list() {
     for name in $(config_list_triggers); do
         local type skill prompt_text label schedule_info last_status
 
@@ -102,13 +102,12 @@ cmd_triggers_list() {
             schedule_info="$watch ($pattern)"
         fi
 
-        # Last session status for this trigger
         last_status=""
         if [[ -f "$HISTORY_FILE" ]]; then
             local last_line
             last_line="$(grep "\"trigger\":\"${name}\"" "$HISTORY_FILE" 2>/dev/null | tail -1 || true)"
             if [[ -n "$last_line" ]]; then
-                last_status="$(status_mark "$(json_field "$last_line" "status")")"
+                last_status="$(status_mark "$(sess_json_field "$last_line" "status")")"
             fi
         fi
 
@@ -119,7 +118,7 @@ cmd_triggers_list() {
 
 # --- Preview handlers (called by fzf --preview) ---
 
-cmd_preview_session() {
+_tui_preview_session() {
     local short_id="$1"
 
     local session_line
@@ -129,16 +128,16 @@ cmd_preview_session() {
     }
 
     local full_id status trigger label started duration session_id working_dir exit_code attempt
-    full_id="$(json_field "$session_line" "id")"
-    status="$(json_field "$session_line" "status")"
-    trigger="$(json_field "$session_line" "trigger")"
-    label="$(json_field "$session_line" "label")"
-    started="$(json_field "$session_line" "started")"
-    duration="$(json_field_num "$session_line" "duration")"
-    session_id="$(json_field "$session_line" "session_id")"
-    working_dir="$(json_field "$session_line" "working_dir")"
-    exit_code="$(json_field_num "$session_line" "exit_code")"
-    attempt="$(json_field_num "$session_line" "attempt")"
+    full_id="$(sess_json_field "$session_line" "id")"
+    status="$(sess_json_field "$session_line" "status")"
+    trigger="$(sess_json_field "$session_line" "trigger")"
+    label="$(sess_json_field "$session_line" "label")"
+    started="$(sess_json_field "$session_line" "started")"
+    duration="$(sess_json_field_num "$session_line" "duration")"
+    session_id="$(sess_json_field "$session_line" "session_id")"
+    working_dir="$(sess_json_field "$session_line" "working_dir")"
+    exit_code="$(sess_json_field_num "$session_line" "exit_code")"
+    attempt="$(sess_json_field_num "$session_line" "attempt")"
 
     echo "Session:  $short_id"
     echo "Full ID:  $full_id"
@@ -158,21 +157,15 @@ cmd_preview_session() {
     if [[ -f "$log_file" && -s "$log_file" ]]; then
         format_session_log "$log_file" | head -200
     elif [[ "$status" == "running" ]]; then
-        # Check if the process is actually still alive
         local pid
-        pid="$(json_field_num "$session_line" "pid")"
+        pid="$(sess_json_field_num "$session_line" "pid")"
         if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-            # Auto-clean stale session
-            local trigger started working_dir
-            trigger="$(json_field "$session_line" "trigger")"
-            started="$(json_field "$session_line" "started")"
-            working_dir="$(json_field "$session_line" "working_dir")"
-            local duration=$(( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo "$(date +%s)") ))
+            local dur=$(( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo "$(date +%s)") ))
             printf '{"id":"%s","short":"%s","trigger":"%s","working_dir":"%s","started":"%s","status":"error","duration":%d}\n' \
-                "$full_id" "$short_id" "$trigger" "$working_dir" "$started" "$duration" \
+                "$full_id" "$short_id" "$trigger" "$working_dir" "$started" "$dur" \
                 >> "$HISTORY_FILE"
             rm -f "${STATE_DIR}/locks/${trigger}.lock"
-            echo "⚠ Process $pid was no longer running — marked as error."
+            echo "Process $pid was no longer running — marked as error."
             echo ""
         else
             local elapsed=""
@@ -194,7 +187,6 @@ cmd_preview_session() {
         [[ -n "$exit_code" ]] && echo "Exit code: $exit_code"
     fi
 
-    # Show stderr if present
     local stderr_file="${log_file%.log}.stderr"
     if [[ -f "$stderr_file" && -s "$stderr_file" ]]; then
         echo ""
@@ -204,7 +196,7 @@ cmd_preview_session() {
     fi
 }
 
-cmd_preview_trigger() {
+_tui_preview_trigger() {
     local trigger_name="$1"
 
     echo "Trigger: $trigger_name"
@@ -226,7 +218,6 @@ cmd_preview_trigger() {
         (( ${#prompt_text} > 80 )) && echo "             ${prompt_text:80:80}"
     fi
 
-    # Type-specific fields
     if [[ "$type" == "timer" ]]; then
         local interval cron_expr
         interval="$(config_trigger_field "$trigger_name" "interval" || true)"
@@ -255,11 +246,11 @@ cmd_preview_trigger() {
         local count=0
         while IFS= read -r line; do
             local st short started dur
-            st="$(json_field "$line" "status")"
-            short="$(json_field "$line" "short")"
-            [[ -z "$short" ]] && short="$(json_field "$line" "id")"
-            started="$(json_field "$line" "started")"
-            dur="$(json_field_num "$line" "duration")"
+            st="$(sess_json_field "$line" "status")"
+            short="$(sess_json_field "$line" "short")"
+            [[ -z "$short" ]] && short="$(sess_json_field "$line" "id")"
+            started="$(sess_json_field "$line" "started")"
+            dur="$(sess_json_field_num "$line" "duration")"
 
             printf "  %-14s  %-8s  %-14s  %s\n" \
                 "$short" "$(status_mark "$st")" \
@@ -272,7 +263,7 @@ cmd_preview_trigger() {
 }
 
 # Find the line number of a trigger in the config file
-config_trigger_line() {
+_config_trigger_line() {
     local trigger_name="$1"
     local line_num=0
     local in_trigger=false
@@ -294,7 +285,6 @@ config_trigger_line() {
             local val="${stripped#*=}"
             val="$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')"
             if [[ "$val" == "$trigger_name" ]]; then
-                # Return the [[trigger]] line (one before the name line at minimum)
                 echo $(( line_num - 1 ))
                 return 0
             fi
@@ -307,29 +297,28 @@ config_trigger_line() {
 
 # --- Main TUI ---
 
-cmd_tui() {
+_tui_main() {
     local mode="${1:-sessions}"
-    local self
-    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    local workmode_bin="$BIN_DIR/workmode"
 
     while true; do
         local result=""
 
         if [[ "$mode" == "sessions" ]]; then
-            result="$( "$self" --sessions-list | fzf \
+            result="$( _tui_sessions_list | fzf \
                 --header=$'SESSIONS  enter: log/tail | ctrl-d/u: scroll preview | ctrl-r: resume | ctrl-x: run | ctrl-s: stop | ctrl-k: kill | ctrl-t: triggers | ctrl-l: refresh\n' \
-                --preview="$self --preview-session {1}" \
+                --preview="$workmode_bin tui --preview-session {1}" \
                 --preview-window="right:55%:wrap" \
                 --expect="ctrl-r,ctrl-t,ctrl-x,ctrl-s,ctrl-k" \
                 --bind="ctrl-d:preview-half-page-down" \
                 --bind="ctrl-u:preview-half-page-up" \
-                --bind="ctrl-l:reload($self --sessions-list)" \
+                --bind="ctrl-l:reload($workmode_bin tui --sessions-list)" \
                 --no-mouse \
                 --height=100% \
                 --layout=reverse \
                 --prompt="sessions > " \
                 --no-info \
-            )" || break  # ESC / ctrl-c
+            )" || break
 
             local key selected selected_id
             key="$(head -1 <<< "$result")"
@@ -343,19 +332,23 @@ cmd_tui() {
                     ;;
                 ctrl-r)
                     if [[ -n "$selected_id" ]]; then
-                        exec "$BIN_DIR/workmode-sessions" resume "$selected_id"
+                        source "$SCRIPT_DIR/lib/cmd/session.sh"
+                        cmd_session_resume "$selected_id"
+                        break
                     fi
                     ;;
                 ctrl-s)
                     if [[ -n "$selected_id" ]]; then
-                        "$BIN_DIR/workmode-sessions" stop "$selected_id" 2>&1 || true
+                        source "$SCRIPT_DIR/lib/cmd/session.sh"
+                        cmd_session_stop "$selected_id" 2>&1 || true
                         sleep 0.5
                         continue
                     fi
                     ;;
                 ctrl-k)
                     if [[ -n "$selected_id" ]]; then
-                        "$BIN_DIR/workmode-sessions" kill "$selected_id" 2>&1 || true
+                        source "$SCRIPT_DIR/lib/cmd/session.sh"
+                        cmd_session_kill "$selected_id" 2>&1 || true
                         sleep 0.5
                         continue
                     fi
@@ -370,14 +363,14 @@ cmd_tui() {
                     fi
                     ;;
                 *)
-                    # enter — tail if running, show logs if done
                     if [[ -n "$selected_id" ]]; then
                         local session_status
                         session_status="$(awk '{print $2}' <<< "$selected")"
+                        source "$SCRIPT_DIR/lib/cmd/session.sh"
                         if [[ "$session_status" == "RUN" ]]; then
-                            "$BIN_DIR/workmode-sessions" tail "$selected_id" || true
+                            cmd_session_tail "$selected_id" || true
                         else
-                            "$BIN_DIR/workmode-sessions" logs "$selected_id" | less -R
+                            cmd_session_logs "$selected_id" | less -R
                         fi
                         continue
                     fi
@@ -385,14 +378,14 @@ cmd_tui() {
             esac
 
         elif [[ "$mode" == "triggers" ]]; then
-            result="$( "$self" --triggers-list | fzf \
+            result="$( _tui_triggers_list | fzf \
                 --header=$'TRIGGERS  ctrl-t: sessions | enter: run trigger | ctrl-e: edit config | ctrl-l: refresh\n' \
-                --preview="$self --preview-trigger {1}" \
+                --preview="$workmode_bin tui --preview-trigger {1}" \
                 --preview-window="right:55%:wrap" \
                 --expect="ctrl-t,ctrl-e" \
                 --bind="ctrl-d:preview-half-page-down" \
                 --bind="ctrl-u:preview-half-page-up" \
-                --bind="ctrl-l:reload($self --triggers-list)" \
+                --bind="ctrl-l:reload($workmode_bin tui --triggers-list)" \
                 --no-mouse \
                 --height=100% \
                 --layout=reverse \
@@ -411,16 +404,14 @@ cmd_tui() {
                     continue
                     ;;
                 ctrl-e)
-                    # Open config at the trigger's line
                     local line_num=1
                     if [[ -n "$selected_name" ]]; then
-                        line_num="$(config_trigger_line "$selected_name")"
+                        line_num="$(_config_trigger_line "$selected_name")"
                     fi
                     "${EDITOR:-vi}" "+${line_num}" "$WORKMODE_CONFIG"
                     continue
                     ;;
                 *)
-                    # enter — run the trigger
                     if [[ -n "$selected_name" ]]; then
                         exec "$BIN_DIR/workmode-run" --trigger "$selected_name"
                     fi
@@ -433,11 +424,15 @@ cmd_tui() {
 }
 
 # --- Dispatch ---
-case "${1:-}" in
-    --sessions-list)     cmd_sessions_list ;;
-    --triggers-list)     cmd_triggers_list ;;
-    --preview-session)   shift; cmd_preview_session "$@" ;;
-    --preview-trigger)   shift; cmd_preview_trigger "$@" ;;
-    sessions|triggers)   cmd_tui "$1" ;;
-    *)                   cmd_tui sessions ;;
-esac
+# Handles both the main TUI and internal fzf callbacks
+
+cmd_tui() {
+    case "${1:-}" in
+        --sessions-list)     _tui_sessions_list ;;
+        --triggers-list)     _tui_triggers_list ;;
+        --preview-session)   shift; _tui_preview_session "$@" ;;
+        --preview-trigger)   shift; _tui_preview_trigger "$@" ;;
+        sessions|triggers)   _tui_main "$1" ;;
+        *)                   _tui_main "${1:-sessions}" ;;
+    esac
+}

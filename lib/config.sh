@@ -195,6 +195,67 @@ interval_to_minutes() {
     esac
 }
 
+# Output full config as JSON
+# Outputs a single JSON object with general settings and triggers array
+config_to_json() {
+    local state_dir max_parallel
+    state_dir="$(config_state_dir)"
+    max_parallel="$(config_max_parallel)"
+
+    printf '{"general":{"state_dir":"%s","max_parallel":%s},"triggers":[' \
+        "$state_dir" "$max_parallel"
+
+    local first=true
+    for name in $(config_list_triggers); do
+        $first || printf ','
+        first=false
+
+        local type skill prompt_text permissions working_dir cooldown check
+        type="$(config_trigger_field "$name" "type" || echo "")"
+        skill="$(config_trigger_field "$name" "skill" || true)"
+        prompt_text="$(config_trigger_field "$name" "prompt" || true)"
+        permissions="$(config_trigger_field "$name" "permissions" || echo "default")"
+        working_dir="$(config_trigger_field "$name" "working_dir" || true)"
+        cooldown="$(config_trigger_field "$name" "cooldown" || true)"
+        check="$(config_trigger_field "$name" "check" || true)"
+
+        printf '{"name":"%s","type":"%s","permissions":"%s"' "$name" "$type" "$permissions"
+        [[ -n "$skill" ]] && printf ',"skill":"%s"' "$skill"
+        [[ -n "$prompt_text" ]] && printf ',"prompt":"%s"' "$(echo "$prompt_text" | sed 's/"/\\"/g')"
+        [[ -n "$working_dir" ]] && printf ',"working_dir":"%s"' "$working_dir"
+        [[ -n "$cooldown" ]] && printf ',"cooldown":%s' "$cooldown"
+        [[ -n "$check" ]] && printf ',"check":"%s"' "$(echo "$check" | sed 's/"/\\"/g')"
+
+        if [[ "$type" == "timer" ]]; then
+            local interval cron_expr
+            interval="$(config_trigger_field "$name" "interval" || true)"
+            cron_expr="$(config_trigger_field "$name" "cron" || true)"
+            [[ -n "$interval" ]] && printf ',"interval":"%s"' "$interval"
+            [[ -n "$cron_expr" ]] && printf ',"cron":"%s"' "$cron_expr"
+        elif [[ "$type" == "file" ]]; then
+            local watch pattern settle
+            watch="$(config_trigger_field "$name" "watch" || true)"
+            pattern="$(config_trigger_field "$name" "pattern" || true)"
+            settle="$(config_trigger_field "$name" "settle" || true)"
+            [[ -n "$watch" ]] && printf ',"watch":"%s"' "$watch"
+            [[ -n "$pattern" ]] && printf ',"pattern":"%s"' "$pattern"
+            [[ -n "$settle" ]] && printf ',"settle":%s' "$settle"
+        fi
+
+        local retry retry_max retry_delay
+        retry="$(config_trigger_field "$name" "retry" || true)"
+        retry_max="$(config_trigger_field "$name" "retry_max" || true)"
+        retry_delay="$(config_trigger_field "$name" "retry_delay" || true)"
+        [[ -n "$retry" ]] && printf ',"retry":"%s"' "$retry"
+        [[ -n "$retry_max" ]] && printf ',"retry_max":%s' "$retry_max"
+        [[ -n "$retry_delay" ]] && printf ',"retry_delay":%s' "$retry_delay"
+
+        printf '}'
+    done
+
+    printf ']}\n'
+}
+
 # Convert interval to cron schedule
 # "2h" → "0 */2 * * *", "15m" → "*/15 * * * *"
 interval_to_cron() {

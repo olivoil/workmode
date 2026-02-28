@@ -16,14 +16,14 @@ else
 fi
 
 # Extract JSON field value (simple, no jq dependency)
-json_field() {
+parse_json_field() {
     local json="$1" field="$2"
     local result
     result="$(echo "$json" | grep -oP "\"${field}\"\\s*:\\s*\"[^\"]*\"" | head -1 | grep -oP '"[^"]*"$' | tr -d '"' || true)"
     echo "$result"
 }
 
-json_field_num() {
+parse_json_field_num() {
     local json="$1" field="$2"
     local result
     result="$(echo "$json" | grep -oP "\"${field}\"\\s*:\\s*[0-9]+" | head -1 | grep -oP '[0-9]+$' || true)"
@@ -127,7 +127,7 @@ find_session_log() {
     session_line="$(resolve_session "$lookup" "$history_file")" || return 1
 
     local full_id
-    full_id="$(json_field "$session_line" "id")"
+    full_id="$(parse_json_field "$session_line" "id")"
     if [[ -n "$full_id" && -f "$log_dir/${full_id}.log" ]]; then
         echo "$log_dir/${full_id}.log"
         return 0
@@ -236,9 +236,9 @@ extract_summary() {
 get_session_pid() {
     local session_line="$1"
     local status pid
-    status="$(json_field "$session_line" "status")"
+    status="$(parse_json_field "$session_line" "status")"
     if [[ "$status" == "running" ]]; then
-        pid="$(json_field_num "$session_line" "pid")"
+        pid="$(parse_json_field_num "$session_line" "pid")"
         [[ -n "$pid" && "$pid" != "0" ]] && echo "$pid"
     fi
 }
@@ -259,10 +259,10 @@ terminate_session() {
     }
 
     local status full_id trigger short_id pid
-    status="$(json_field "$session_line" "status")"
-    full_id="$(json_field "$session_line" "id")"
-    trigger="$(json_field "$session_line" "trigger")"
-    short_id="$(json_field "$session_line" "short")"
+    status="$(parse_json_field "$session_line" "status")"
+    full_id="$(parse_json_field "$session_line" "id")"
+    trigger="$(parse_json_field "$session_line" "trigger")"
+    short_id="$(parse_json_field "$session_line" "short")"
     [[ -z "$short_id" ]] && short_id="$full_id"
 
     if [[ "$status" != "running" ]]; then
@@ -279,8 +279,8 @@ terminate_session() {
     if ! kill -0 "$pid" 2>/dev/null; then
         # Process is gone — clean up stale running status
         local started working_dir
-        started="$(json_field "$session_line" "started")"
-        working_dir="$(json_field "$session_line" "working_dir")"
+        started="$(parse_json_field "$session_line" "started")"
+        working_dir="$(parse_json_field "$session_line" "working_dir")"
         local duration=$(( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo "$(date +%s)") ))
         printf '{"id":"%s","short":"%s","trigger":"%s","working_dir":"%s","started":"%s","status":"error","duration":%d}\n' \
             "$full_id" "$short_id" "$trigger" "$working_dir" "$started" "$duration" \
@@ -303,8 +303,8 @@ terminate_session() {
 
         # Log termination to history
         local started working_dir
-        started="$(json_field "$session_line" "started")"
-        working_dir="$(json_field "$session_line" "working_dir")"
+        started="$(parse_json_field "$session_line" "started")"
+        working_dir="$(parse_json_field "$session_line" "working_dir")"
         local duration=$(( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo "$(date +%s)") ))
         printf '{"id":"%s","short":"%s","trigger":"%s","working_dir":"%s","started":"%s","status":"%s","duration":%d}\n' \
             "$full_id" "$short_id" "$trigger" "$working_dir" "$started" "$new_status" "$duration" \
@@ -327,7 +327,7 @@ dedup_sessions() {
         [[ -z "$line" ]] && continue
         [[ "$line" == *'"id"'* ]] || continue
         local id
-        id="$(json_field "$line" "id")"
+        id="$(parse_json_field "$line" "id")"
         [[ -z "$id" ]] && continue
 
         local already_seen=false
@@ -344,7 +344,7 @@ dedup_sessions() {
         # Apply filter if set
         if [[ -n "$filter" ]]; then
             local status
-            status="$(json_field "$line" "status")"
+            status="$(parse_json_field "$line" "status")"
             [[ "$status" != "$filter" ]] && continue
         fi
 

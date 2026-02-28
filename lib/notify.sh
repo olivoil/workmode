@@ -22,14 +22,14 @@ notify_stuck() {
     local skill="$1"
     local trigger="$2"
     local session_id="$3"
-    notify-send -a "$NOTIFY_APP" -u critical "workmode" "⏸ ${skill} needs permission — run: workmode sessions resume ${session_id}"
+    notify-send -a "$NOTIFY_APP" -u critical "workmode" "⏸ ${skill} needs permission — run: workmode session resume ${session_id}"
 }
 
 notify_error() {
     local skill="$1"
     local trigger="$2"
     local session_id="$3"
-    notify-send -a "$NOTIFY_APP" -u critical "workmode" "❌ ${skill} failed — run: workmode sessions ${session_id}"
+    notify-send -a "$NOTIFY_APP" -u critical "workmode" "❌ ${skill} failed — run: workmode session logs ${session_id}"
 }
 
 format_duration() {
