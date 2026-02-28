@@ -14,19 +14,23 @@ import (
 
 // Client wraps the workmode CLI and direct file access.
 type Client struct {
-	bin      string // path or name of CLI binary
-	stateDir string // e.g. ~/.local/share/workmode
+	bin        string // path or name of CLI binary
+	appName    string
+	stateDir   string // e.g. ~/.local/share/workmode
+	configPath string
 }
 
 // NewClient creates a client. cliBinary is the CLI command name (e.g. "workmode").
 // appName is used for default state dir (e.g. "workmode" → ~/.local/share/workmode).
 func NewClient(cliBinary, appName string) *Client {
 	c := &Client{
-		bin: cliBinary,
+		bin:        cliBinary,
+		appName:    appName,
+		configPath: DefaultConfigPath(appName),
 	}
 
-	// Try to get state_dir from config.
-	if cfg, err := c.Config(); err == nil && cfg.General.StateDir != "" {
+	// Read state_dir directly from TOML config (no subprocess).
+	if cfg, err := ReadConfigFile(c.configPath); err == nil && cfg.General.StateDir != "" {
 		c.stateDir = expandHome(cfg.General.StateDir)
 	}
 	if c.stateDir == "" {
@@ -59,6 +63,17 @@ func (c *Client) ReadSessions() ([]Session, error) {
 // ReadLog reads and parses a session's log file.
 func (c *Client) ReadLog(shortID string) ([]StreamEvent, error) {
 	return ParseLogFile(c.LogPath(shortID))
+}
+
+// --- Direct file access (config) ---
+
+// ReadTriggers reads triggers directly from the TOML config file.
+func (c *Client) ReadTriggers() ([]Trigger, error) {
+	cfg, err := ReadConfigFile(c.configPath)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.Triggers, nil
 }
 
 // --- CLI wrappers (for actions and systemd status) ---

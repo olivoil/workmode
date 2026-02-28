@@ -86,11 +86,12 @@ func newModel() model {
 }
 
 func (m model) Init() tea.Cmd {
+	// Load sessions and triggers from files (fast, no subprocess).
+	// Defer status (needs systemctl) to a short tick so UI renders immediately.
 	return tea.Batch(
-		m.loadStatus,
 		m.loadSessions,
 		m.loadTriggers,
-		m.tickStatus(),
+		m.tickStatusNow(),
 	)
 }
 
@@ -525,7 +526,7 @@ func (m *model) loadSessions() tea.Msg {
 }
 
 func (m *model) loadTriggers() tea.Msg {
-	triggers, err := m.client.Triggers()
+	triggers, err := m.client.ReadTriggers()
 	return TriggersLoadedMsg{Triggers: triggers, Err: err}
 }
 
@@ -556,6 +557,12 @@ func (m *model) resumeSession(s backend.Session) tea.Cmd {
 	cmd := m.client.ResumeCmd(s)
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return ResumeExitMsg{Err: err}
+	})
+}
+
+func (m *model) tickStatusNow() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return StatusTickMsg{}
 	})
 }
 
