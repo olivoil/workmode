@@ -2,7 +2,10 @@ package app
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -33,6 +36,16 @@ func Run() error {
 		m.watcher = w
 		defer w.Close()
 	}
+
+	// Listen for SIGUSR2 (Omarchy theme change signal).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGUSR2)
+	go func() {
+		for range sigCh {
+			p.Send(ThemeChangedMsg{})
+		}
+	}()
+	defer signal.Stop(sigCh)
 
 	_, err = p.Run()
 	return err
@@ -102,6 +115,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ready = true
 		m.layoutViews()
+		return m, nil
+
+	case ThemeChangedMsg:
+		ui.ReloadTheme()
+		m.sessionsView.RefreshStyles()
+		m.triggersView.RefreshStyles()
 		return m, nil
 
 	case StatusLoadedMsg:
@@ -304,7 +323,7 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		m.sessionsView.Blur()
 		// Start watching the log file for live updates.
 		if m.watcher != nil && s.Status == "running" {
-			m.watcher.WatchLog(s.Short)
+			m.watcher.WatchLog(s.ID)
 		}
 		return m, m.openLogView(*s)
 
@@ -530,9 +549,24 @@ func (m *model) loadTriggers() tea.Msg {
 	return TriggersLoadedMsg{Triggers: triggers, Err: err}
 }
 
+func (m *model) sessionByShort(shortID string) *backend.Session {
+	for i := range m.sessions {
+		if m.sessions[i].Short == shortID {
+			return &m.sessions[i]
+		}
+	}
+	return nil
+}
+
 func (m *model) loadPreview(shortID string) tea.Cmd {
+	s := m.sessionByShort(shortID)
+	if s == nil {
+		return nil
+	}
+	fullID := s.ID
+	client := m.client
 	return func() tea.Msg {
-		events, err := m.client.ReadLog(shortID)
+		events, err := client.ReadLog(fullID)
 		return LogLoadedMsg{ShortID: shortID, Events: events, Err: err}
 	}
 }
@@ -547,9 +581,11 @@ func (m *model) loadSelectedPreview() tea.Cmd {
 
 func (m *model) openLogView(s backend.Session) tea.Cmd {
 	client := m.client
+	fullID := s.ID
+	short := s.Short
 	return func() tea.Msg {
-		events, _ := client.ReadLog(s.Short)
-		return LogLoadedMsg{ShortID: s.Short, Events: events}
+		events, _ := client.ReadLog(fullID)
+		return LogLoadedMsg{ShortID: short, Events: events}
 	}
 }
 

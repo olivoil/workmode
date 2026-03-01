@@ -52,8 +52,7 @@ func New() Model {
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(ui.ColorBorder)
 	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("#ffffff")).
-		Background(ui.ColorAccent).
+		Foreground(lipgloss.Color(ui.T.Accent)).
 		Bold(true)
 	t.SetStyles(s)
 
@@ -64,6 +63,20 @@ func New() Model {
 		preview: vp,
 		focused: true,
 	}
+}
+
+// RefreshStyles reapplies theme colors to the table (called on theme change).
+func (m *Model) RefreshStyles() {
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		Bold(true).
+		BorderBottom(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(ui.ColorBorder)
+	s.Selected = s.Selected.
+		Foreground(lipgloss.Color(ui.T.Accent)).
+		Bold(true)
+	m.table.SetStyles(s)
 }
 
 // SetSessions updates the session data and rebuilds the table rows.
@@ -93,10 +106,22 @@ func (m *Model) SetPreview(shortID string, events []backend.StreamEvent) {
 	m.previewEvents = events
 
 	var sess *backend.Session
+	var sessIdx int
 	for i := range m.sessions {
 		if m.sessions[i].Short == shortID {
 			sess = &m.sessions[i]
+			sessIdx = i
 			break
+		}
+	}
+
+	// Update summary in the table row if we have log events.
+	if len(events) > 0 {
+		summary := backend.ExtractSummary(events, 60)
+		rows := m.table.Rows()
+		if sessIdx < len(rows) && len(rows[sessIdx]) == 6 {
+			rows[sessIdx][5] = summary
+			m.table.SetRows(rows)
 		}
 	}
 

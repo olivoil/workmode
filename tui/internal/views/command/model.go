@@ -340,8 +340,8 @@ var (
 
 	styleSelectedRow = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("#ffffff")).
-				Background(ui.ColorAccent)
+				Foreground(lipgloss.Color(ui.T.Background)).
+				Background(lipgloss.Color(ui.T.Accent))
 
 	styleNormalValue = lipgloss.NewStyle().
 				Foreground(ui.ColorWhite)

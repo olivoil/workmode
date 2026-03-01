@@ -52,8 +52,7 @@ func New() Model {
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(ui.ColorBorder)
 	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("#ffffff")).
-		Background(ui.ColorAccent).
+		Foreground(lipgloss.Color(ui.T.Accent)).
 		Bold(true)
 	t.SetStyles(s)
 
@@ -63,6 +62,20 @@ func New() Model {
 		table:   t,
 		preview: vp,
 	}
+}
+
+// RefreshStyles reapplies theme colors to the table (called on theme change).
+func (m *Model) RefreshStyles() {
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		Bold(true).
+		BorderBottom(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(ui.ColorBorder)
+	s.Selected = s.Selected.
+		Foreground(lipgloss.Color(ui.T.Accent)).
+		Bold(true)
+	m.table.SetStyles(s)
 }
 
 // SetTriggers updates the trigger data.

@@ -48,9 +48,9 @@ func (c *Client) HistoryPath() string {
 	return filepath.Join(c.stateDir, "history.jsonl")
 }
 
-// LogPath returns the path to a session's log file.
-func (c *Client) LogPath(shortID string) string {
-	return filepath.Join(c.stateDir, "logs", shortID+".log")
+// LogPath returns the path to a session's log file (uses the full session ID).
+func (c *Client) LogPath(sessionID string) string {
+	return filepath.Join(c.stateDir, "logs", sessionID+".log")
 }
 
 // --- Direct file access (fast, used for live updates) ---
@@ -60,9 +60,9 @@ func (c *Client) ReadSessions() ([]Session, error) {
 	return ParseSessionsFromFile(c.HistoryPath())
 }
 
-// ReadLog reads and parses a session's log file.
-func (c *Client) ReadLog(shortID string) ([]StreamEvent, error) {
-	return ParseLogFile(c.LogPath(shortID))
+// ReadLog reads and parses a session's log file by full session ID.
+func (c *Client) ReadLog(sessionID string) ([]StreamEvent, error) {
+	return ParseLogFile(c.LogPath(sessionID))
 }
 
 // --- Direct file access (config) ---

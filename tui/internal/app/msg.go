@@ -45,3 +45,6 @@ type ResumeExitMsg struct {
 type WatcherReadyMsg struct {
 	Watcher *backend.Watcher
 }
+
+// ThemeChangedMsg is sent when an Omarchy theme change is detected (via SIGUSR2).
+type ThemeChangedMsg struct{}
